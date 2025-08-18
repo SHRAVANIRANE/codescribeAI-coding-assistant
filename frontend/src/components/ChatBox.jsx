@@ -1,15 +1,45 @@
-// src/components/ChatBox.jsx
 import { useState } from "react";
 
 export default function ChatBox() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  const handleSend = () => {
+  const handleSend = async () => {
     if (!input.trim()) return;
-    setMessages([...messages, { role: "user", text: input }]);
+
+    const newMsg = { role: "user", text: input };
+    setMessages((prev) => [...prev, newMsg]);
     setInput("");
-    // Later: integrate backend API call here
+    setLoading(true);
+
+    try {
+      // 🔹 Call FastAPI chat endpoint instead of /me
+      const res = await fetch("http://127.0.0.1:8000/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: input }),
+        credentials: "include",
+      });
+
+      if (!res.ok) {
+        throw new Error("Backend error");
+      }
+
+      const data = await res.json();
+
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", text: data.reply }, // ✅ backend sends reply
+      ]);
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", text: "⚠️ Could not reach AI backend." },
+      ]);
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -28,6 +58,9 @@ export default function ChatBox() {
             {msg.text}
           </div>
         ))}
+        {loading && (
+          <div className="text-gray-400 text-sm">Assistant is typing...</div>
+        )}
       </div>
 
       {/* Input Box */}

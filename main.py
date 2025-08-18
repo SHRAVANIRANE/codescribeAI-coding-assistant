@@ -40,7 +40,7 @@ serializer = URLSafeSerializer(SECRET_KEY)
 # ---- CORS ----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # frontend
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],  # frontend
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -96,9 +96,10 @@ async def github_login():
     )
 
 @app.get("/auth/github/callback")
-async def github_callback(code: str, state: Optional[str] = None, response: Response = None):
+async def github_callback(code: str, state: Optional[str] = None):
     if not state:
         raise HTTPException(status_code=400, detail="Missing state parameter")
+
     async with httpx.AsyncClient() as client:
         token_response = await client.post(
             "https://github.com/login/oauth/access_token",
@@ -127,14 +128,66 @@ async def github_callback(code: str, state: Optional[str] = None, response: Resp
 
         # Store signed cookie
         signed_cookie = serializer.dumps({"session_id": session_id})
-        response = RedirectResponse(url="http://localhost:3000")  # frontend landing page
+        response = RedirectResponse(url="http://localhost:5173")  # frontend landing page
         response.set_cookie(
             key="session_id",
             value=signed_cookie,
             httponly=True,
-            samesite="Lax"
+            samesite="Lax",       # helps avoid CSRF issues
+            secure=False,         # True if using https
+        
         )
         return response
+    
+@app.post("/api/chat")
+async def chat(request: Request):
+    data = await request.json()
+    message = data.get("message", "")
+
+    if not message.strip():
+        return JSONResponse({"reply": ""})
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": "phi3:mini",
+                    "prompt": message,
+                    "stream": False
+                }
+            )
+            # Log full backend response
+            print("AI backend status:", response.status_code)
+            print("AI backend content:", response.text)
+
+            response.raise_for_status()
+            result = response.json()
+            reply = result.get("response", "Sorry, I couldn't generate a reply.")
+            return JSONResponse({"reply": reply})
+
+    except httpx.RequestError as e:
+        print("RequestError:", e)
+        return JSONResponse({"reply": "⚠️ Could not reach AI backend."}, status_code=500)
+    except httpx.HTTPStatusError as e:
+        print("HTTPStatusError:", e)
+        return JSONResponse({"reply": f"⚠️ AI backend returned {e.response.status_code}"}, status_code=500)
+    except Exception as e:
+        print("Unexpected Error:", e)
+        return JSONResponse({"reply": "⚠️ Could not process your request."}, status_code=500)
+
+
+@app.get("/me")
+async def get_me(user=Depends(get_current_user)):
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            "https://api.github.com/user",
+            headers={"Authorization": f"Bearer {user['access_token']}"}
+        )
+        r.raise_for_status()
+        return r.json()
+
+
 
 @app.post("/logout")
 async def logout(response: Response):
