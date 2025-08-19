@@ -18,6 +18,10 @@ app = FastAPI()
 # ---- Session persistence ----
 SESSIONS_FILE = "sessions.json"
 
+# ---- GitHub API URL ----
+GITHUB_API_URL = "https://api.github.com/users"
+
+
 def load_sessions():
     if os.path.exists(SESSIONS_FILE):
         with open(SESSIONS_FILE, "r") as f:
@@ -187,7 +191,18 @@ async def get_me(user=Depends(get_current_user)):
         r.raise_for_status()
         return r.json()
 
-
+@app.get("/repos/{username}")
+async def get_github_repos(username: str):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{GITHUB_API_URL}/{username}/repos")
+        
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="User not found")
+        elif response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail="Error fetching repositories")
+        
+        repos = response.json()
+        return [{"name": repo["name"], "url": repo["html_url"]} for repo in repos]
 
 @app.post("/logout")
 async def logout(response: Response):
