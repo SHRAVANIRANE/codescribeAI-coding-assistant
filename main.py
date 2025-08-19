@@ -9,6 +9,7 @@ import httpx
 from typing import Optional
 from dotenv import load_dotenv
 from uuid import uuid4
+import time
 
 # Load environment variables first
 load_dotenv()
@@ -143,43 +144,63 @@ async def github_callback(code: str, state: Optional[str] = None):
         )
         return response
     
+# Chat endpoint
 @app.post("/api/chat")
 async def chat(request: Request):
     data = await request.json()
     message = data.get("message", "")
+    repo = data.get("repo")
+    github_user = data.get("github_user")  # optional if you want to fetch private repos later
 
     if not message.strip():
         return JSONResponse({"reply": ""})
 
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                "http://localhost:11434/api/generate",
-                json={
-                    "model": "phi3:mini",
-                    "prompt": message,
-                    "stream": False
-                }
-            )
-            # Log full backend response
-            print("AI backend status:", response.status_code)
-            print("AI backend content:", response.text)
+    if not repo:
+        return JSONResponse({"reply": "⚠️ Please select a repo first."}, status_code=400)
 
-            response.raise_for_status()
-            result = response.json()
-            reply = result.get("response", "Sorry, I couldn't generate a reply.")
+    # Step 1: Fetch repo contents
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.get(f"https://api.github.com/repos/{github_user}/{repo}/contents")
+            if res.status_code != 200:
+                raise HTTPException(status_code=res.status_code, detail="Error fetching repo files")
+            files = res.json()
+
+            # Step 2: Get code of main files (for MVP, limit to .py)
+            code_combined = ""
+            for file in files:
+                if file["type"] == "file" and file["name"].endswith(".py"):
+                    file_res = await client.get(file["download_url"])
+                    file_res.raise_for_status()
+                    code_combined += f"# File: {file['name']}\n{file_res.text}\n\n"
+
+            if not code_combined:
+                code_combined = "# No Python files found in repo."
+
+            # Step 3: Build prompt for AI
+            prompt = f"Repository: {repo}\n\nCode:\n{code_combined}\n\nQuestion: {message}"
+
+            # Step 4: Send prompt to AI backend
+            ai_res = await client.post(
+                "http://localhost:11434/api/generate",  # your local AI backend
+                json={"model": "phi3:mini", "prompt": prompt, "stream": False},
+                timeout=30.0
+            )
+            ai_res.raise_for_status()
+            ai_data = ai_res.json()
+            reply = ai_data.get("response", "⚠️ AI could not generate a response.")
+
             return JSONResponse({"reply": reply})
 
     except httpx.RequestError as e:
         print("RequestError:", e)
-        return JSONResponse({"reply": "⚠️ Could not reach AI backend."}, status_code=500)
+        return JSONResponse({"reply": "⚠️ Could not reach GitHub or AI backend."}, status_code=500)
     except httpx.HTTPStatusError as e:
         print("HTTPStatusError:", e)
-        return JSONResponse({"reply": f"⚠️ AI backend returned {e.response.status_code}"}, status_code=500)
+        return JSONResponse({"reply": f"⚠️ Backend returned {e.response.status_code}"}, status_code=500)
     except Exception as e:
         print("Unexpected Error:", e)
-        return JSONResponse({"reply": "⚠️ Could not process your request."}, status_code=500)
-
+        return JSONResponse({"reply": "⚠️ Something went wrong."}, status_code=500)
 
 @app.get("/me")
 async def get_me(user=Depends(get_current_user)):
