@@ -10,9 +10,18 @@ from typing import Optional
 from dotenv import load_dotenv
 from uuid import uuid4
 import time
+from pydantic import BaseModel
+
 
 # Load environment variables first
 load_dotenv()
+
+# ---- Environment variables ----
+# Ensure GITHUB_TOKEN is set in your .env file
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+
+# ---- Ollama API URL ----
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 
 app = FastAPI()
 
@@ -21,6 +30,16 @@ SESSIONS_FILE = "sessions.json"
 
 # ---- GitHub API URL ----
 GITHUB_API_URL = "https://api.github.com/users"
+
+class ChatRequest(BaseModel):
+    message: str
+    repo: str
+    github_user: str
+
+class ChatResponse(BaseModel):
+    reply: str
+    sources: list[str] = []
+    meta: dict = {}
 
 
 def load_sessions():
@@ -144,64 +163,143 @@ async def github_callback(code: str, state: Optional[str] = None):
         )
         return response
     
+async def gh_get(url: str):
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
+        r = await c.get(url, headers=headers)
+    # rate limit detection
+    if r.status_code == 403 and r.headers.get("X-RateLimit-Remaining") == "0":
+        reset = r.headers.get("X-RateLimit-Reset")
+        return JSONResponse(
+            {"reply": "⚠️ GitHub rate limit reached. Try again in a few minutes."},
+            status_code=429
+        )
+    r.raise_for_status()
+    return r
+
+async def get_repo_default_branch(owner: str, repo: str) -> str:
+    r = await gh_get(f"https://api.github.com/repos/{owner}/{repo}")
+    if isinstance(r, JSONResponse):  # rate limited
+        raise HTTPException(status_code=429, detail="Rate limited")
+    return r.json()["default_branch"]
+
+async def count_all_files(owner: str, repo: str) -> int:
+    # Use Git Trees API to count all blobs (files) recursively
+    default_branch = await get_repo_default_branch(owner, repo)
+    r = await gh_get(f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}?recursive=1")
+    if isinstance(r, JSONResponse):
+        raise HTTPException(status_code=429, detail="Rate limited")
+    data = r.json()
+    tree = data.get("tree", [])
+    return sum(1 for t in tree if t.get("type") == "blob")
+
+async def fetch_root_contents(owner: str, repo: str):
+    r = await gh_get(f"https://api.github.com/repos/{owner}/{repo}/contents")
+    if isinstance(r, JSONResponse):
+        raise HTTPException(status_code=429, detail="Rate limited")
+    return r.json()
+
+async def get_readme_text(owner: str, repo: str) -> str | None:
+    # Try common README names in the root
+    items = await fetch_root_contents(owner, repo)
+    readme = next((f for f in items if f.get("type")=="file" and f["name"].lower().startswith("readme")), None)
+    if not readme:
+        return None
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
+        fr = await c.get(readme["download_url"])
+        fr.raise_for_status()
+        return fr.text[:4000]  # keep prompt small
+
+
 # Chat endpoint
-@app.post("/api/chat")
-async def chat(request: Request):
-    data = await request.json()
-    message = data.get("message", "")
-    repo = data.get("repo")
-    github_user = data.get("github_user")  # optional if you want to fetch private repos later
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    msg = req.message.strip().lower()
+    if not msg:
+        return ChatResponse(reply="")
 
-    if not message.strip():
-        return JSONResponse({"reply": ""})
+    # 1) Local skills (no LLM)
+    if "name of" in msg or ("name" in msg and "repo" in msg):
+        return ChatResponse(reply=req.repo)
 
-    if not repo:
-        return JSONResponse({"reply": "⚠️ Please select a repo first."}, status_code=400)
+    if "number of files" in msg or "count files" in msg or "how many files" in msg:
+        try:
+            total = await count_all_files(req.github_user, req.repo)
+            return ChatResponse(reply=f"{total} files in {req.github_user}/{req.repo}.", meta={"owner": req.github_user, "repo": req.repo})
+        except HTTPException as e:
+            if e.status_code == 429:
+                return ChatResponse(reply="⚠️ GitHub rate limit reached. Please try again later.")
+            raise
+        except Exception as e:
+            return ChatResponse(reply=f"⚠️ Failed to count files: {e}")
 
-    # Step 1: Fetch repo contents
+    # 2) “What is this repo about?” → try README first, else LLM
+    if "what is this repo about" in msg or "explain this repo" in msg or "summary" in msg:
+        try:
+            readme = await get_readme_text(req.github_user, req.repo)
+        except HTTPException as e:
+            if e.status_code == 429:
+                return ChatResponse(reply="⚠️ GitHub rate limit reached. Please try again later.")
+            return ChatResponse(reply=f"⚠️ GitHub error: {e.detail}")
+        except Exception as e:
+            readme = None
+
+        if readme:
+            # Ask LLM to summarize the README
+            prompt = f"Summarize this repository for a beginner in 5-7 lines:\n\n{readme}\n\nSummary:"
+        else:
+            # fallback: list root files and ask LLM to infer (less accurate)
+            try:
+                items = await fetch_root_contents(req.github_user, req.repo)
+                filelist = "\n".join(f"- {it['path']}" for it in items if it.get("type") == "file")[:3000]
+            except Exception:
+                filelist = ""
+            prompt = f"Given these visible files, infer what the repository is about in 4-6 lines. If unsure, say so.\n\n{filelist}\n\nAnswer:"
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as c:
+                ai_res = await c.post(f"{OLLAMA_URL}/api/generate",
+                                      json={"model": "phi3:mini", "prompt": prompt, "stream": False})
+                ai_res.raise_for_status()
+                ai = ai_res.json()
+                return ChatResponse(reply=ai.get("response", "").strip() or "⚠️ AI returned empty response.")
+        except Exception as e:
+            return ChatResponse(reply=f"⚠️ Could not reach AI backend: {e}")
+
+    # 3) Generic fallback → LLM with minimal context
+    prompt = f"Answer concisely:\n\nQ: {req.message}\nA:"
     try:
-        async with httpx.AsyncClient() as client:
-            res = await client.get(f"https://api.github.com/repos/{github_user}/{repo}/contents")
-            if res.status_code != 200:
-                raise HTTPException(status_code=res.status_code, detail="Error fetching repo files")
-            files = res.json()
-
-            # Step 2: Get code of main files (for MVP, limit to .py)
-            code_combined = ""
-            for file in files:
-                if file["type"] == "file" and file["name"].endswith(".py"):
-                    file_res = await client.get(file["download_url"])
-                    file_res.raise_for_status()
-                    code_combined += f"# File: {file['name']}\n{file_res.text}\n\n"
-
-            if not code_combined:
-                code_combined = "# No Python files found in repo."
-
-            # Step 3: Build prompt for AI
-            prompt = f"Repository: {repo}\n\nCode:\n{code_combined}\n\nQuestion: {message}"
-
-            # Step 4: Send prompt to AI backend
-            ai_res = await client.post(
-                "http://localhost:11434/api/generate",  # your local AI backend
-                json={"model": "phi3:mini", "prompt": prompt, "stream": False},
-                timeout=30.0
-            )
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as c:
+            ai_res = await c.post(f"{OLLAMA_URL}/api/generate",
+                                  json={"model": "phi3:mini", "prompt": prompt, "stream": False})
             ai_res.raise_for_status()
-            ai_data = ai_res.json()
-            reply = ai_data.get("response", "⚠️ AI could not generate a response.")
-
-            return JSONResponse({"reply": reply})
-
-    except httpx.RequestError as e:
-        print("RequestError:", e)
-        return JSONResponse({"reply": "⚠️ Could not reach GitHub or AI backend."}, status_code=500)
-    except httpx.HTTPStatusError as e:
-        print("HTTPStatusError:", e)
-        return JSONResponse({"reply": f"⚠️ Backend returned {e.response.status_code}"}, status_code=500)
+            ai = ai_res.json()
+            return ChatResponse(reply=ai.get("response", "").strip() or "⚠️ AI returned empty response.")
     except Exception as e:
-        print("Unexpected Error:", e)
-        return JSONResponse({"reply": "⚠️ Something went wrong."}, status_code=500)
+        return ChatResponse(reply=f"⚠️ Could not reach AI backend: {e}")
 
+@app.get("/health")
+async def health():
+    probs = []
+    # Check GitHub
+    try:
+        r = await gh_get("https://api.github.com/rate_limit")
+        if isinstance(r, JSONResponse):
+            probs.append("github: rate limited")
+    except Exception as e:
+        probs.append(f"github: {e}")
+    # Check Ollama
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as c:
+            r = await c.get(f"{OLLAMA_URL}/api/tags")
+            r.raise_for_status()
+    except Exception as e:
+        probs.append(f"ollama: {e}")
+    return {"ok": len(probs)==0, "problems": probs}
+
+    
 @app.get("/me")
 async def get_me(user=Depends(get_current_user)):
     async with httpx.AsyncClient() as client:
@@ -229,3 +327,9 @@ async def get_github_repos(username: str):
 async def logout(response: Response):
     response.delete_cookie("session_id")
     return {"message": "Logged out"}
+
+import requests
+url = "https://api.github.com/repos/SHRAVANIRANE/codescribeAI-coding-assistant/contents"
+res = requests.get(url)
+print(res.status_code)
+print(res.json()[:2])  # show first 2 files
