@@ -276,7 +276,7 @@ export default function ChatBox() {
         )}
 
         {/* Messages (scrollable only) */}
-        <div className="flex-1 overflow-y-auto max-h-130 space-y-4 p-4 pr-2 custom-scrollbar ">
+        <div className="flex-1 overflow-y-auto max-h-140 space-y-4 p-4 pr-2 custom-scrollbar ">
           {messages.map((msg, idx) => (
             <div
               key={idx}
@@ -287,8 +287,8 @@ export default function ChatBox() {
               <div
                 className={`p-3 rounded-2xl max-w-xl shadow-md text-sm leading-relaxed ${
                   msg.role === "user"
-                    ? "bg-blue-600 text-white rounded-br-none"
-                    : "bg-gray-700 text-gray-200 rounded-bl-none"
+                    ? "bg-gradient-to-r from-blue-500 to-blue-700 text-white rounded-br-none"
+                    : "bg-gradient-to-r from-gray-700 to-gray-800 text-gray-100 rounded-bl-none"
                 }`}
               >
                 {msg.role === "assistant"
