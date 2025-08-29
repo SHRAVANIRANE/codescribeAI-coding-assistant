@@ -276,7 +276,7 @@ export default function ChatBox() {
         )}
 
         {/* Messages (scrollable only) */}
-        <div className="flex-1 overflow-y-auto space-y-4 p-4 pr-2 custom-scrollbar">
+        <div className="flex-1 overflow-y-auto max-h-130 space-y-4 p-4 pr-2 custom-scrollbar ">
           {messages.map((msg, idx) => (
             <div
               key={idx}
