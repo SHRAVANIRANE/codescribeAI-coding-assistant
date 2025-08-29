@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { materialDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 
@@ -12,6 +12,13 @@ export default function ChatBox() {
   const [repoLoading, setRepoLoading] = useState(false);
   const [repoError, setRepoError] = useState("");
   const [selectedRepo, setSelectedRepo] = useState(null);
+
+  const messagesEndRef = useRef(null);
+
+  // Auto-scroll to bottom on new messages
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, loading]);
 
   // Chat send handler
   const handleSend = async () => {
@@ -132,33 +139,54 @@ export default function ChatBox() {
             value={githubUser}
             onChange={(e) => setGithubUser(e.target.value)}
             placeholder="Enter username"
-            className="flex-1 p-2 rounded-l-xl bg-gray-700 border border-gray-600 text-gray-100 outline-none"
+            className="bg-transparent border-none outline-none w-100 py-[10px] px-[20px] text-[16px] rounded-l-full shadow-[inset_2px_5px_10px_rgb(5,5,5)] text-white"
           />
-          <button
+          <a
+            href="#_"
             onClick={fetchRepos}
-            className="bg-green-600 px-4 rounded-r-xl hover:bg-green-700 transition"
+            className="relative inline-flex items-center justify-center p-4 px-5 py-3 rounded-r-full overflow-hidden font-medium text-indigo-600 transition duration-300 ease-out shadow-xl group hover:ring-1 hover:ring-purple-500"
           >
-            Fetch
-          </button>
+            <span className="absolute inset-0 w-full h-full bg-gradient-to-br from-blue-600 via-purple-600 to-pink-700"></span>
+            <span className="absolute bottom-0 right-0 block w-64 h-64 mb-32 mr-4 transition duration-500 origin-bottom-left transform rotate-45 translate-x-24 bg-pink-500 rounded-full opacity-30 group-hover:rotate-90 ease"></span>
+            <span className="relative text-white">Fetch</span>
+          </a>
         </div>
 
         {/* Repo List */}
         {!selectedRepo && (
           <>
-            {repoLoading && <p className="text-gray-400">Loading...</p>}
-            {repoError && <p className="text-red-500">{repoError}</p>}
-            <ul className="flex-1 overflow-y-auto space-y-2 mt-2">
+            {repoLoading && (
+              <div className="flex items-center justify-center py-6">
+                <span className="animate-spin h-6 w-6 border-2 border-blue-500 border-t-transparent rounded-full"></span>
+                <p className="ml-3 text-blue-400 font-medium">
+                  Fetching repositories...
+                </p>
+              </div>
+            )}
+
+            {repoError && (
+              <p className="text-red-400 bg-red-900/30 border border-red-700 px-4 py-2 rounded-lg text-sm mt-2">
+                {repoError}
+              </p>
+            )}
+
+            <ul className="flex-1 overflow-y-auto space-y-3 mt-4 pr-2">
               {repos.map((repo, idx) => (
                 <li
                   key={idx}
                   onClick={() => setSelectedRepo(repo)}
-                  className="p-2 bg-gray-700 rounded hover:bg-gray-600 cursor-pointer transition"
+                  className="group p-4 bg-gradient-to-r from-gray-800 to-gray-700 rounded-xl shadow-md hover:from-gray-700 hover:to-gray-600 cursor-pointer transition-all duration-300 border border-gray-600 hover:border-blue-500"
                 >
-                  <div className="text-blue-400 font-medium hover:underline">
-                    {repo.name}
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-lg font-semibold text-white group-hover:text-blue-400 transition">
+                      {repo.name}
+                    </h3>
+                    <span className="text-xs text-gray-400 bg-gray-900 px-2 py-1 rounded-md">
+                      ⭐ {repo.stargazers_count || 0}
+                    </span>
                   </div>
                   {repo.description && (
-                    <p className="text-gray-400 text-sm truncate">
+                    <p className="text-gray-400 text-sm mt-2 line-clamp-2">
                       {repo.description}
                     </p>
                   )}
@@ -170,77 +198,136 @@ export default function ChatBox() {
 
         {/* Selected Repo Info */}
         {selectedRepo && (
-          <div className="bg-gray-700 rounded p-3">
-            <h3 className="text-lg font-semibold text-gray-100">
-              {selectedRepo.name}
-            </h3>
-            {selectedRepo.description && (
-              <p className="text-gray-300 text-sm my-1">
+          <div className="bg-gradient-to-br from-gray-800 to-gray-700 rounded-xl p-6 shadow-lg border border-gray-600">
+            {/* Repo Header */}
+            <div className="flex items-center justify-between">
+              <h3 className="text-xl font-bold text-white">
+                {selectedRepo.name}
+              </h3>
+              {selectedRepo.stargazers_count !== undefined && (
+                <span className="text-sm bg-gray-900 px-3 py-1 rounded-md text-gray-300 border border-gray-600">
+                  ⭐ {selectedRepo.stargazers_count}
+                </span>
+              )}
+            </div>
+
+            {/* Description */}
+            {selectedRepo.description ? (
+              <p className="text-gray-300 text-sm mt-3 leading-relaxed">
                 {selectedRepo.description}
               </p>
+            ) : (
+              <p className="text-gray-500 italic mt-3 text-sm">
+                No description available
+              </p>
             )}
-            <p className="text-gray-400 text-sm">
-              ⭐ Stars: {selectedRepo.stargazers_count || 0}
-            </p>
-            <button
-              onClick={() => setSelectedRepo(null)}
-              className="mt-2 bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700 transition"
-            >
-              Back to Repo List
-            </button>
+
+            {/* Extra Info */}
+            <div className="flex flex-wrap gap-3 mt-4 text-sm text-gray-400">
+              {selectedRepo.language && (
+                <span className="px-3 py-1 rounded-full bg-gray-900 border border-gray-600">
+                  {selectedRepo.language}
+                </span>
+              )}
+              {selectedRepo.forks_count !== undefined && (
+                <span className="px-3 py-1 rounded-full bg-gray-900 border border-gray-600">
+                  🍴 {selectedRepo.forks_count} Forks
+                </span>
+              )}
+              {selectedRepo.open_issues_count !== undefined && (
+                <span className="px-3 py-1 rounded-full bg-gray-900 border border-gray-600">
+                  🐛 {selectedRepo.open_issues_count} Issues
+                </span>
+              )}
+            </div>
+
+            {/* Actions */}
+            <div className="mt-6 flex gap-3">
+              {selectedRepo.html_url && (
+                <a
+                  href={selectedRepo.html_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex-1 text-center bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded-lg transition"
+                >
+                  View on GitHub
+                </a>
+              )}
+              <button
+                onClick={() => setSelectedRepo(null)}
+                className="flex-1 text-center bg-gray-600 hover:bg-gray-500 text-white font-medium py-2 px-4 rounded-lg transition"
+              >
+                Back
+              </button>
+            </div>
           </div>
         )}
       </div>
 
       {/* Chat Area */}
-      <div className="w-2/3 flex flex-col p-4">
+      <div className="w-2/3 flex flex-col bg-gradient-to-br from-gray-900 to-gray-800 rounded-xl shadow-lg border border-gray-700">
         {selectedRepo && (
-          <div className="mb-3 bg-gray-700 p-2 rounded text-gray-200">
+          <div className="mb-2 bg-gray-800 px-4 py-2 rounded-lg text-gray-300 border-b border-gray-700 text-sm">
             Chatting about:{" "}
-            <span className="font-semibold">{selectedRepo.name}</span>
+            <span className="font-semibold text-blue-400">
+              {selectedRepo.name}
+            </span>
           </div>
         )}
 
-        {/* Messages */}
-        <div className="flex-1 overflow-y-auto space-y-3 mb-4 pr-2">
+        {/* Messages (scrollable only) */}
+        <div className="flex-1 overflow-y-auto space-y-4 p-4 pr-2 custom-scrollbar">
           {messages.map((msg, idx) => (
             <div
               key={idx}
-              className={`p-3 rounded-lg max-w-xl break-words ${
-                msg.role === "user"
-                  ? "bg-blue-600 text-white self-end"
-                  : "bg-gray-700 text-gray-200 self-start"
+              className={`flex ${
+                msg.role === "user" ? "justify-end" : "justify-start"
               }`}
             >
-              {msg.role === "assistant" ? (
-                renderAssistantMessage(msg.text)
-              ) : (
-                <span>{msg.text}</span>
-              )}
+              <div
+                className={`p-3 rounded-2xl max-w-xl shadow-md text-sm leading-relaxed ${
+                  msg.role === "user"
+                    ? "bg-blue-600 text-white rounded-br-none"
+                    : "bg-gray-700 text-gray-200 rounded-bl-none"
+                }`}
+              >
+                {msg.role === "assistant"
+                  ? renderAssistantMessage(msg.text)
+                  : msg.text}
+              </div>
             </div>
           ))}
 
           {loading && (
-            <div className="text-gray-400 text-sm">Assistant is typing...</div>
+            <div className="flex items-center space-x-2 text-gray-400 text-sm">
+              <span className="animate-pulse">Generating response</span>
+              <span className="animate-bounce">.</span>
+              <span className="animate-bounce delay-150">.</span>
+              <span className="animate-bounce delay-300">.</span>
+            </div>
           )}
+
+          <div ref={messagesEndRef} />
         </div>
 
-        {/* Input Box */}
-        <div className="flex">
-          <input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="Type your code query..."
-            className="flex-1 p-2 bg-gray-700 border border-gray-600 rounded-l-xl outline-none text-gray-100 placeholder-gray-400"
-            onKeyDown={(e) => e.key === "Enter" && handleSend()}
-          />
-          <button
-            onClick={handleSend}
-            className="bg-blue-600 text-white px-4 rounded-r-xl hover:bg-blue-700 transition"
-            disabled={!selectedRepo}
-          >
-            Send
-          </button>
+        {/* Input Box (always visible at bottom) */}
+        <div className="border-t border-gray-700 bg-gray-900 p-3">
+          <div className="flex items-center gap-2">
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder="Type your code query..."
+              className="flex-1 p-3 bg-gray-800 border border-gray-700 rounded-xl outline-none text-gray-100 placeholder-gray-500 focus:ring-2 focus:ring-blue-500 transition"
+              onKeyDown={(e) => e.key === "Enter" && handleSend()}
+            />
+            <button
+              onClick={handleSend}
+              disabled={!selectedRepo}
+              className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-xl shadow-md transition disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Send
+            </button>
+          </div>
         </div>
       </div>
     </div>
