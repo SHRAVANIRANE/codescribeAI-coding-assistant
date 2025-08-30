@@ -126,7 +126,7 @@ export default function ChatBox() {
   };
 
   return (
-    <div className="flex h-full w-full bg-gray-900 rounded-xl shadow-xl overflow-hidden">
+    <div className="flex h-full w-full bg-gray-900 max-h-172 shadow-xl custom-scrollbar">
       {/* Sidebar */}
       <div className="w-1/3 bg-gray-800 p-4 flex flex-col">
         <h2 className="text-xl font-semibold mb-3 text-gray-100">
@@ -156,7 +156,7 @@ export default function ChatBox() {
         {!selectedRepo && (
           <>
             {repoLoading && (
-              <div className="flex items-center justify-center py-6">
+              <div className="flex items-center justify-center py-6 ">
                 <span className="animate-spin h-6 w-6 border-2 border-blue-500 border-t-transparent rounded-full"></span>
                 <p className="ml-3 text-blue-400 font-medium">
                   Fetching repositories...
@@ -276,7 +276,7 @@ export default function ChatBox() {
         )}
 
         {/* Messages (scrollable only) */}
-        <div className="flex-1 overflow-y-auto max-h-140 space-y-4 p-4 pr-2 custom-scrollbar ">
+        <div className="flex-1 overflow-y-auto max-h-screen space-y-4 p-4 pr-2 custom-scrollbar ">
           {messages.map((msg, idx) => (
             <div
               key={idx}

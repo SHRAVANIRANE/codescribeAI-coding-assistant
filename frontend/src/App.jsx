@@ -8,7 +8,7 @@ import Playground from "./pages/Playground";
 export default function App() {
   return (
     <Router>
-      <div className="flex flex-col h-screen">
+      <div className="flex flex-col h-screen bg-black">
         <Navbar />
         <Routes>
           <Route path="/" element={<Home />} />
