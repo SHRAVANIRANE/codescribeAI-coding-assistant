@@ -1,4 +1,4 @@
-# CodeScribeAI
+# CodeScribeAI 🤖
 
 **CodeScribeAI** is an AI-powered coding assistant that helps developers write, debug, and understand code faster. It provides intelligent code suggestions, syntax highlighting, and code explanations across multiple programming languages.
 
