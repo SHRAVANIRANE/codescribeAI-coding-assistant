@@ -3,7 +3,7 @@ import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { materialDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import FilePreview from "./FilePreview";
 
-export default function ChatBox() {
+export default function ChatBox({ askAI }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -353,6 +353,48 @@ export default function ChatBox() {
             owner={githubUser}
             repo={selectedRepo?.name}
             filePath={selectedFile}
+            askAI={(code, path) => {
+              const userMsg = `Please analyze this file: ${path}`;
+
+              // show only filename in chat
+              setMessages((prev) => [...prev, { role: "user", text: userMsg }]);
+
+              // trigger backend with full content
+              setLoading(true);
+              fetch("http://127.0.0.1:8000/api/chat", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  message: userMsg,
+                  repo: selectedRepo?.name,
+                  github_user: githubUser,
+                  file: path,
+                  file_content: code, // ✅ pass actual content but don’t show in chat
+                }),
+                credentials: "include",
+              })
+                .then((res) => res.json())
+                .then((data) => {
+                  setMessages((prev) => [
+                    ...prev,
+                    {
+                      role: "assistant",
+                      text: data.reply,
+                      sourceDocs: data.sources || [],
+                    },
+                  ]);
+                })
+                .catch(() => {
+                  setMessages((prev) => [
+                    ...prev,
+                    {
+                      role: "assistant",
+                      text: "⚠️ Could not reach AI backend.",
+                    },
+                  ]);
+                })
+                .finally(() => setLoading(false));
+            }}
           />
         </div>
       )}
