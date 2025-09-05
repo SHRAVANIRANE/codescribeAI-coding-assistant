@@ -70,6 +70,7 @@ export default function ChatBox({ askAI }) {
           repo: selectedRepo.name,
           github_user: githubUser,
           file: selectedFile || null,
+          file_content: code,
         }),
         credentials: "include",
       });
