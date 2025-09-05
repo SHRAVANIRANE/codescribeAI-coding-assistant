@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { materialDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import FilePreview from "./FilePreview";
 
 export default function ChatBox() {
   const [messages, setMessages] = useState([]);
@@ -13,22 +14,53 @@ export default function ChatBox() {
   const [repoError, setRepoError] = useState("");
   const [selectedRepo, setSelectedRepo] = useState(null);
 
+  // NEW
+  const [repoAnalytics, setRepoAnalytics] = useState(null);
+  const [fileTree, setFileTree] = useState([]);
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [fileLoading, setFileLoading] = useState(false); // NEW
+
   const messagesEndRef = useRef(null);
 
-  // Auto-scroll to bottom on new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
-  // Chat send handler
+  // fetch analytics + file tree
+  useEffect(() => {
+    if (!selectedRepo) return;
+
+    (async () => {
+      try {
+        const res = await fetch(
+          `http://127.0.0.1:8000/repos/${githubUser}/${selectedRepo.name}/analytics`
+        );
+        if (!res.ok) throw new Error();
+        setRepoAnalytics(await res.json());
+      } catch {
+        setRepoAnalytics(null);
+      }
+    })();
+
+    (async () => {
+      try {
+        const res = await fetch(
+          `http://127.0.0.1:8000/repos/${githubUser}/${selectedRepo.name}/files`
+        );
+        if (!res.ok) throw new Error();
+        setFileTree(await res.json());
+      } catch {
+        setFileTree([]);
+      }
+    })();
+  }, [selectedRepo, githubUser]);
+
   const handleSend = async () => {
     if (!input.trim() || !selectedRepo) return;
-
     const newMsg = { role: "user", text: input };
-    setMessages((prev) => [...prev, newMsg]);
+    setMessages((p) => [...p, newMsg]);
     setInput("");
     setLoading(true);
-
     try {
       const res = await fetch("http://127.0.0.1:8000/api/chat", {
         method: "POST",
@@ -37,24 +69,19 @@ export default function ChatBox() {
           message: input,
           repo: selectedRepo.name,
           github_user: githubUser,
+          file: selectedFile || null,
         }),
         credentials: "include",
       });
-
       if (!res.ok) throw new Error("Backend error");
-
       const data = await res.json();
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          text: data.reply,
-          sourceDocs: data.sources || [], // attach retrieved docs if backend sends them
-        },
+      setMessages((p) => [
+        ...p,
+        { role: "assistant", text: data.reply, sourceDocs: data.sources || [] },
       ]);
     } catch {
-      setMessages((prev) => [
-        ...prev,
+      setMessages((p) => [
+        ...p,
         { role: "assistant", text: "⚠️ Could not reach AI backend." },
       ]);
     } finally {
@@ -62,29 +89,51 @@ export default function ChatBox() {
     }
   };
 
-  // Linkify function to convert URLs in text to clickable links
-  const linkify = (text) =>
-    text.split(/(https?:\/\/[^\s]+)/g).map((part, i) =>
-      part.match(/https?:\/\/[^\s]+/) ? (
-        <a
-          key={i}
-          href={part}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-blue-400 underline"
-        >
-          {part}
-        </a>
-      ) : (
-        <span key={i}>{part}</span>
-      )
-    );
+  // NEW: guess language by extension for SyntaxHighlighter
+  const guessLang = (path = "") => {
+    const ext = path.split(".").pop()?.toLowerCase();
+    const map = {
+      js: "javascript",
+      jsx: "jsx",
+      ts: "typescript",
+      tsx: "tsx",
+      py: "python",
+      json: "json",
+      md: "markdown",
+      yml: "yaml",
+      yaml: "yaml",
+      sh: "bash",
+      css: "css",
+      html: "html",
+      txt: "text",
+    };
+    return map[ext] || "text";
+  };
 
-  // Render assistant message with code blocks
-  const renderAssistantMessage = (text) => {
-    return text.split(/```(.*?)```/gs).map((chunk, i) => {
+  // UPDATED: fetch file content + show file preview column
+  const fetchFileContent = async (path) => {
+    setSelectedFile(path);
+    setFileLoading(true);
+    setFileContent("");
+    try {
+      const res = await fetch(
+        `http://127.0.0.1:8000/repos/${githubUser}/${
+          selectedRepo.name
+        }/file?path=${encodeURIComponent(path)}`
+      );
+      if (!res.ok) throw new Error("File content fetch failed");
+      const data = await res.text();
+      setFileContent(data);
+    } catch {
+      setFileContent("⚠️ Failed to fetch file content");
+    } finally {
+      setFileLoading(false);
+    }
+  };
+
+  const renderAssistantMessage = (text) =>
+    text.split(/```(.*?)```/gs).map((chunk, i) => {
       if (i % 2 === 1) {
-        // Code block
         const [lang, ...codeLines] = chunk.split("\n");
         const code = codeLines.join("\n");
         return (
@@ -98,16 +147,13 @@ export default function ChatBox() {
           </SyntaxHighlighter>
         );
       }
-      // Regular text with line breaks
       return (
         <pre key={i} className="whitespace-pre-wrap">
           {chunk}
         </pre>
       );
     });
-  };
 
-  // Fetch GitHub repos
   const fetchRepos = async () => {
     if (!githubUser.trim()) return;
     setRepoLoading(true);
@@ -115,8 +161,7 @@ export default function ChatBox() {
     try {
       const res = await fetch(`http://127.0.0.1:8000/repos/${githubUser}`);
       if (!res.ok) throw new Error("User not found");
-      const data = await res.json();
-      setRepos(data);
+      setRepos(await res.json());
     } catch (err) {
       setRepoError(err.message);
       setRepos([]);
@@ -128,7 +173,7 @@ export default function ChatBox() {
   return (
     <div className="flex h-full w-full bg-gray-900 max-h-172 shadow-xl custom-scrollbar">
       {/* Sidebar */}
-      <div className="w-1/3 bg-gray-800 p-4 flex flex-col">
+      <div className="w-1/4 bg-gray-800 p-4 flex flex-col">
         <h2 className="text-xl font-semibold mb-3 text-gray-100">
           GitHub Repos
         </h2>
@@ -163,18 +208,20 @@ export default function ChatBox() {
                 </p>
               </div>
             )}
-
             {repoError && (
               <p className="text-red-400 bg-red-900/30 border border-red-700 px-4 py-2 rounded-lg text-sm mt-2">
                 {repoError}
               </p>
             )}
-
             <ul className="flex-1 overflow-y-auto space-y-3 mt-4 pr-2">
               {repos.map((repo, idx) => (
                 <li
                   key={idx}
-                  onClick={() => setSelectedRepo(repo)}
+                  onClick={() => {
+                    setSelectedRepo(repo);
+                    setSelectedFile(file.path); // reset any open file
+                    setFileContent("");
+                  }}
                   className="group p-4 bg-gradient-to-r from-gray-800 to-gray-700 rounded-xl shadow-md hover:from-gray-700 hover:to-gray-600 cursor-pointer transition-all duration-300 border border-gray-600 hover:border-blue-500"
                 >
                   <div className="flex items-center justify-between">
@@ -199,7 +246,6 @@ export default function ChatBox() {
         {/* Selected Repo Info */}
         {selectedRepo && (
           <div className="bg-gradient-to-br from-gray-800 to-gray-700 rounded-xl p-6 shadow-lg border border-gray-600">
-            {/* Repo Header */}
             <div className="flex items-center justify-between">
               <h3 className="text-xl font-bold text-white">
                 {selectedRepo.name}
@@ -211,7 +257,6 @@ export default function ChatBox() {
               )}
             </div>
 
-            {/* Description */}
             {selectedRepo.description ? (
               <p className="text-gray-300 text-sm mt-3 leading-relaxed">
                 {selectedRepo.description}
@@ -222,7 +267,6 @@ export default function ChatBox() {
               </p>
             )}
 
-            {/* Extra Info */}
             <div className="flex flex-wrap gap-3 mt-4 text-sm text-gray-400">
               {selectedRepo.language && (
                 <span className="px-3 py-1 rounded-full bg-gray-900 border border-gray-600">
@@ -241,7 +285,41 @@ export default function ChatBox() {
               )}
             </div>
 
-            {/* Actions */}
+            {repoAnalytics && (
+              <div className="mt-4 p-3 bg-gray-900 rounded-lg border border-gray-700">
+                <h4 className="text-sm text-gray-300 font-semibold mb-2">
+                  📊 Repo Analytics
+                </h4>
+                <ul className="space-y-1 text-xs text-gray-400">
+                  <li>Commits: {repoAnalytics.commits}</li>
+                  <li>Contributors: {repoAnalytics.contributors}</li>
+                  <li>Stars growth: {repoAnalytics.stars_trend || "N/A"}</li>
+                  <li>
+                    Issues: {repoAnalytics.issues_open} open /{" "}
+                    {repoAnalytics.issues_closed} closed
+                  </li>
+                </ul>
+              </div>
+            )}
+
+            {/* File Tree */}
+            <div className="mt-4 p-3 bg-gray-900 rounded-lg border border-gray-700">
+              <h4 className="text-sm text-gray-300 font-semibold mb-2">
+                📂 File Explorer
+              </h4>
+              <ul className="space-y-1 text-xs text-gray-400 max-h-48 overflow-y-auto custom-scrollbar">
+                {fileTree.map((file, idx) => (
+                  <li
+                    key={idx}
+                    onClick={() => fetchFileContent(file.path)}
+                    className="cursor-pointer hover:text-blue-400"
+                  >
+                    {file.type === "dir" ? "📁" : "📄"} {file.path}
+                  </li>
+                ))}
+              </ul>
+            </div>
+
             <div className="mt-6 flex gap-3">
               {selectedRepo.html_url && (
                 <a
@@ -254,7 +332,11 @@ export default function ChatBox() {
                 </a>
               )}
               <button
-                onClick={() => setSelectedRepo(null)}
+                onClick={() => {
+                  setSelectedRepo(null);
+                  setSelectedFile(null);
+                  setFileContent("");
+                }}
                 className="flex-1 text-center bg-gray-600 hover:bg-gray-500 text-white font-medium py-2 px-4 rounded-lg transition"
               >
                 Back
@@ -264,8 +346,19 @@ export default function ChatBox() {
         )}
       </div>
 
-      {/* Chat Area */}
-      <div className="w-2/3 flex flex-col bg-gradient-to-br from-gray-900 to-gray-800 rounded-xl shadow-lg border border-gray-700">
+      {/* Middle Column: File Preview */}
+      {selectedFile && (
+        <div className="w-2/5 bg-gray-900 border-x border-gray-700 p-4">
+          <FilePreview
+            owner={githubUser}
+            repo={selectedRepo?.name}
+            filePath={selectedFile}
+          />
+        </div>
+      )}
+
+      {/* Chat Area (shrinks when a file is open) */}
+      <div className="flex-1 flex flex-col bg-gradient-to-br from-gray-900 to-gray-800 rounded-xl shadow-lg border border-gray-700">
         {selectedRepo && (
           <div className="mb-2 bg-gray-800 px-4 py-2 rounded-lg text-gray-300 border-b border-gray-700 text-sm">
             Chatting about:{" "}
@@ -275,7 +368,6 @@ export default function ChatBox() {
           </div>
         )}
 
-        {/* Messages (scrollable only) */}
         <div className="flex-1 overflow-y-auto max-h-screen space-y-4 p-4 pr-2 custom-scrollbar ">
           {messages.map((msg, idx) => (
             <div
@@ -310,7 +402,6 @@ export default function ChatBox() {
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Input Box (always visible at bottom) */}
         <div className="border-t border-gray-700 bg-gray-900 p-3">
           <div className="flex items-center gap-2">
             <input

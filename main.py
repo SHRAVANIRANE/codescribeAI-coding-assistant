@@ -640,6 +640,37 @@ async def get_repo_languages(owner: str, repo: str):
         return {"languages": data, "percentages": percentages}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch languages: {e}")
+    
+@app.get("/repos/{owner}/{repo}/files")
+async def get_repo_files(owner: str, repo: str, path: str = ""):
+    """
+    Fetch the file/directory structure of a repository.
+    By default, lists the root. You can pass ?path=subdir to drill deeper.
+    """
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    try:
+        r = await gh_get(url)
+        if isinstance(r, JSONResponse):  # rate limited
+            raise HTTPException(status_code=429, detail="Rate limited")
+
+        data = r.json()
+        if isinstance(data, dict) and data.get("message"):  # GitHub error response
+            raise HTTPException(status_code=400, detail=data.get("message"))
+
+        # Normalize: only keep type + path (and optionally size/url)
+        tree = [
+            {
+                "type": item.get("type"),
+                "path": item.get("path"),
+                "size": item.get("size"),
+                "download_url": item.get("download_url"),
+            }
+            for item in (data if isinstance(data, list) else [data])
+        ]
+        return tree
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch repo files: {e}")
+
 
 
 @app.post("/logout")
