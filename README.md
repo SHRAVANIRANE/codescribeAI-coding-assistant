@@ -57,7 +57,7 @@ npm install
 ```
 ### 3️⃣ Configure Environment
 Create .env files in both frontend/ and backend/ with required configs:
-# backend .env
+backend .env
 ```bash
 GITHUB_CLIENT_ID= github_client_id
 GITHUB_CLIENT_SECRET= github_client_secret
