@@ -21,7 +21,7 @@ export default function Navbar() {
   }, []);
 
   return (
-    <nav className="w-full bg-gray-900 text-white px-6 py-3 flex items-center justify-between shadow-md">
+    <nav className=" t-0 l-0 w-full bg-gray-900 text-white px-6 py-3 flex items-center justify-between shadow-md">
       <h1 className="text-xl font-bold">CodeScribeAI</h1>
       <div className="flex items-center gap-6">
         <a href="/" className="hover:text-gray-400">
@@ -42,7 +42,7 @@ export default function Navbar() {
         ) : (
           <a
             href="http://localhost:8000/login/github"
-            className="hover:text-gray-400"
+            className="px-6 py-3 text-sm font-semibold rounded-lg bg-gradient-to-br from-blue-600 via-purple-600 to-pink-700 hover:ring-1 hover:ring-purple-500 transition"
           >
             Login with GitHub
           </a>
