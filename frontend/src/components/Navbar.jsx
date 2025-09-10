@@ -1,4 +1,12 @@
 import { useState, useEffect } from "react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 export default function Navbar() {
   const [user, setUser] = useState(null);
@@ -11,7 +19,7 @@ export default function Navbar() {
         });
         if (!res.ok) throw new Error("Not logged in");
         const data = await res.json();
-        setUser(data); // data.avatar_url will be your real GitHub avatar
+        setUser(data);
         localStorage.setItem("githubUser", JSON.stringify(data));
       } catch (err) {
         console.log("No user logged in yet");
@@ -20,8 +28,21 @@ export default function Navbar() {
     fetchUser();
   }, []);
 
+  const handleLogout = async () => {
+    try {
+      await fetch("http://localhost:8000/logout", {
+        method: "POST",
+        credentials: "include",
+      });
+    } catch (err) {
+      console.error("Logout failed", err);
+    }
+    localStorage.removeItem("githubUser");
+    setUser(null);
+  };
+
   return (
-    <nav className=" t-0 l-0 w-full bg-gray-900 text-white px-6 py-3 flex items-center justify-between shadow-md">
+    <nav className="t-0 l-0 w-full bg-gray-900 text-white px-6 py-3 flex items-center justify-between shadow-md">
       <h1 className="text-xl font-bold">CodeScribeAI</h1>
       <div className="flex items-center gap-6">
         <a href="/" className="hover:text-gray-400">
@@ -32,13 +53,25 @@ export default function Navbar() {
         </a>
 
         {user ? (
-          <div className="flex items-center gap-3">
-            <img
-              src={user.avatar_url}
-              alt="GitHub Avatar"
-              className="w-10 h-10 rounded-full border border-gray-700"
-            />
-          </div>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <img
+                src={user.avatar_url}
+                alt="GitHub Avatar"
+                className="w-10 h-10 rounded-full border border-gray-700 cursor-pointer"
+              />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent className="bg-gray-800 text-white rounded-lg shadow-lg w-40">
+              <DropdownMenuLabel>{user.login}</DropdownMenuLabel>
+              <DropdownMenuSeparator className="bg-gray-700" />
+              <DropdownMenuItem
+                onClick={handleLogout}
+                className="cursor-pointer hover:bg-gray-700"
+              >
+                Logout
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         ) : (
           <a
             href="http://localhost:8000/login/github"

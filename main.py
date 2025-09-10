@@ -674,9 +674,25 @@ async def get_repo_files(owner: str, repo: str, path: str = ""):
 
 
 @app.post("/logout")
-async def logout(response: Response):
+async def logout(response: Response, user=Depends(get_current_user)):
+    session_id = None
+    cookie = response.set_cookie
+    try:
+        # extract the real session_id from signed cookie
+        session_id = serializer.loads(user["session_id"])["session_id"]
+    except Exception:
+        pass
+
+    # Remove from sessions.json if exists
+    if session_id and session_id in sessions:
+        sessions.pop(session_id, None)
+        save_sessions()
+
+    # Clear cookie
+    response = JSONResponse({"message": "Logged out"})
     response.delete_cookie("session_id")
-    return {"message": "Logged out"}
+    return response
+
 
 import requests
 url = "https://api.github.com/repos/SHRAVANIRANE/codescribeAI-coding-assistant/contents"
