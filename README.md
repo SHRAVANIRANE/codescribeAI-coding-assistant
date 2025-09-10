@@ -1,6 +1,7 @@
 # 🚀 CodeScribeAI
 
 🚧 Note: The Project is in development
+<br>
 **CodeScribeAI** is an AI-powered coding assistant that helps you **explore, debug, and understand code** effortlessly.  
 Built with **React**, **Node.js**, and **Ollama LLM**, it’s designed to boost developer productivity and make coding more intuitive.  
 
@@ -44,32 +45,38 @@ Follow these steps to set up CodeScribeAI locally:
 ```bash
 git clone https://github.com/your-username/codescribeAI.git
 cd codescribeAI
-2️⃣ Install Dependencies
+```
+### 2️⃣ Install Dependencies
+```bash
 Frontend:
 cd frontend
 npm install
 Backend:
 cd backend
 npm install
-3️⃣ Configure Environment
+```
+### 3️⃣ Configure Environment
 Create .env files in both frontend/ and backend/ with required configs:
-ini
-Copy code
 # backend .env
-DB_HOST=your-db-host
-DB_USER=your-db-user
-DB_PASSWORD=your-db-pass
-DB_NAME=your-db-name
-SESSION_SECRET=your-secret
-4️⃣ Run the Project
+```bash
+GITHUB_CLIENT_ID= github_client_id
+GITHUB_CLIENT_SECRET= github_client_secret
+GITHUB_TOKEN= github_token
+OLLAMA_URL= ollama_url
+
+```
+### 4️⃣ Run the Project
 Start backend:
+```bash
 cd backend
 npm run dev
 Start frontend:
 cd frontend
 npm run dev
-
 ```
+
+---
+
 ## 📌 Roadmap
  AI-powered debugging suggestions
 
@@ -103,14 +110,3 @@ If you like this project, please consider giving it a ⭐ on GitHub – it helps
 
 ## 📸 Screenshots (Coming Soon)
 
----
-
-Do you want me to also add **badges** (like build status, license, stars, issues) at the top for a more professional look?
-
-
-
-
-
-
-
-Ask ChatGPT
