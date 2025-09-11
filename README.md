@@ -2,6 +2,9 @@
 
 🚧 Note: The Project is in development
 <br>
+
+---
+
 **CodeScribeAI** is an AI-powered coding assistant that helps you **explore, debug, and understand code** effortlessly.  
 Built with **React**, **Node.js**, and **Ollama LLM**, it’s designed to boost developer productivity and make coding more intuitive.  
 
