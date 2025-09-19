@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 from uuid import uuid4
 import time
 from pydantic import BaseModel
+import httpx
+from starlette import status
+from celery import Celery
 
 
 # Load environment variables first
@@ -513,6 +516,21 @@ async def chat(req: ChatRequest):
 
     # 1) Structured intents → GitHub API (deterministic answers)
     try:
+        if intent == "summarize_file":
+            if not req.file_content:
+                return ChatResponse(reply="⚠️ To explain a file, please select one first.", meta={"grounded": False})
+        
+            prompt = (
+                "You are a helpful software assistant. "
+                "Explain the code below clearly and concisely. "
+                "Highlight its purpose, key functions, and overall structure.\n\n"
+                f"File: `{req.file}`\n\n"
+                f"Code:\n```\n{req.file_content}\n```\n\n"
+                "Explanation:"
+            )
+            ans = await call_llm(prompt)
+            return ChatResponse(reply=ans, sources=[req.file], meta={"grounded": True})
+
         if intent == "get_languages":
             langs = await get_languages(req.github_user, req.repo)
             if not langs:
@@ -692,6 +710,115 @@ async def logout(response: Response, user=Depends(get_current_user)):
     response = JSONResponse({"message": "Logged out"})
     response.delete_cookie("session_id")
     return response
+
+@app.get("/repos/{owner}/{repo}/file-content")
+async def get_file_content(owner: str, repo: str, path: str):
+    """Fetches the raw content of a specific file from a GitHub repository."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    headers = {"Accept": "application/vnd.github.v3.raw"} # Request raw content
+    
+    # Add your GitHub token for authentication and higher rate limits
+    if os.getenv("GITHUB_TOKEN"):
+        headers["Authorization"] = f"token {os.getenv('GITHUB_TOKEN')}"
+    
+    try:
+        # Use an asynchronous client from httpx to make the non-blocking request
+        async with httpx.AsyncClient() as client:
+            res = await client.get(url, headers=headers)
+            res.raise_for_status() # Raise an exception for bad status codes
+            
+        return Response(content=res.text, media_type="text/plain")
+    except httpx.HTTPStatusError as e:
+        # Handle HTTP status errors (e.g., 404, 403) from httpx
+        print(f"Error fetching file content: {e}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail="File not found or access denied."
+        )
+    except httpx.RequestError as e:
+        # Handle other httpx request errors (e.g., network issues)
+        print(f"Error fetching file content: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to connect to GitHub API."
+        )
+    
+# --- Asynchronous Chat Endpoint (for long-running tasks) ---
+# It receives a user's message and offloads it to a Celery worker.
+class ChatQuery(BaseModel):
+    message: str
+    repo: str
+    github_user: str
+    file: Optional[str] = None
+    file_content: Optional[str] = None
+
+@app.post("/api/chat-async", status_code=status.HTTP_202_ACCEPTED)
+async def chat_async(query: ChatQuery):
+    # This is the endpoint that the frontend calls
+    print(f"Received query: '{query.message}' for repo: {query.repo}")
+
+    # Offload the heavy work to a Celery worker
+    task = process_chat_query.delay(query.message, query.repo, query.github_user, query.file, query.file_content)
+
+    # Return the task ID immediately so the frontend doesn't hang
+    return {"task_id": task.id}
+
+# --- Celery Configuration ---
+# Celery instance that will be used to run tasks
+celery_app = Celery(
+    "tasks",
+    broker=os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0"),
+    backend=os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/0")
+)
+
+# --- Celery Task Definition ---
+# This is the function that the Celery worker will run in the background.
+@celery_app.task(name="process_chat_query")
+def process_chat_query(message, repo, github_user, file, file_content):
+    """
+    Simulates a long-running RAG process.
+    """
+    print(f"Starting to process query: '{message}' in the background...")
+    # Simulate a long-running task, like a RAG process
+    time.sleep(30)
+    print("Finished processing.")
+
+    # In a real implementation, you would:
+    # 1. Use the RAG pipeline to get a response and source docs.
+    # 2. Return the result.
+    
+    # Mocking a response for now
+    reply = f"Thank you for asking about `{message}`. I've processed your query for the repository `{repo}`. The answer will be available soon."
+    
+    # Simulate source docs
+    sources = [{"file_path": file, "line_numbers": "1-10"}] if file else []
+    
+    return {"reply": reply, "sources": sources}
+
+# --- Polling Endpoint ---
+# This endpoint allows the frontend to check on the status of a Celery task.
+@app.get("/tasks/{task_id}/status")
+async def get_task_status(task_id: str):
+    task_result = celery_app.AsyncResult(task_id)
+    if task_result.state == "PENDING":
+        return {"status": "PENDING"}
+    elif task_result.state == "FAILURE":
+        return {"status": "FAILURE", "error": str(task_result.info)}
+    elif task_result.state == "SUCCESS":
+        return {"status": "SUCCESS", "result": task_result.result}
+    else:
+        return {"status": task_result.state}
+
+# --- Git Integration (OAuth and Repositories) ---
+# The blueprint mentions using python-gitlab for GitLab integration[cite: 63, 64].
+# A similar library, PyGithub, is recommended for GitHub integration[cite: 87].
+# Your backend should have endpoints to handle the OAuth2 flow[cite: 69].
+
+# --- Production Deployment ---
+# To run this code in production, you would need to:
+# 1. Containerize the application and Celery worker using Docker[cite: 347, 348, 349].
+# 2. Deploy it to a platform like Google Kubernetes Engine (GKE)[cite: 373, 374, 375].
+# 3. Use managed services like Vertex AI Vector Search for your database and Vertex AI Endpoints for LLM serving[cite: 417, 422].
 
 
 import requests
