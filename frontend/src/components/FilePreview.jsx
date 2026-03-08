@@ -5,6 +5,7 @@ import { materialDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 export default function FilePreview({ owner, repo, filePath, askAI }) {
   const [content, setContent] = useState("");
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
   const getLanguage = (path) => {
     if (!path) return "javascript";
@@ -41,6 +42,7 @@ export default function FilePreview({ owner, repo, filePath, askAI }) {
   useEffect(() => {
     if (!filePath || !owner || !repo) return;
     setLoading(true);
+    setError("");
 
     // Use a new, dedicated endpoint for raw file content
     fetch(
@@ -48,18 +50,26 @@ export default function FilePreview({ owner, repo, filePath, askAI }) {
         filePath
       )}`
     )
-      .then((res) => {
+      .then(async (res) => {
         if (!res.ok) {
-          throw new Error("Failed to fetch file content.");
+          let detail = "Failed to fetch file content.";
+          try {
+            const errJson = await res.json();
+            if (errJson?.detail) detail = errJson.detail;
+          } catch {
+            // ignore non-json error body
+          }
+          throw new Error(detail);
         }
-        return res.text(); // Get the raw text content
+        return res.text();
       })
       .then((data) => {
-        setContent(data); // Set the raw content directly
+        setContent(data);
       })
       .catch((err) => {
         console.error(err);
         setContent("No content available.");
+        setError(err.message || "Failed to fetch file content.");
       })
       .finally(() => setLoading(false));
   }, [owner, repo, filePath]);
@@ -92,6 +102,7 @@ export default function FilePreview({ owner, repo, filePath, askAI }) {
       </div>
 
       <div className="flex-1 overflow-y-auto custom-scrollbar">
+        {error && <p className="text-red-400 mb-2 text-xs">{error}</p>}
         {content ? (
           <SyntaxHighlighter
             language={getLanguage(filePath)}

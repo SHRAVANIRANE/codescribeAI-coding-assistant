@@ -1,6 +1,6 @@
-import time
-import json
+﻿import json
 import os
+import asyncio
 from fastapi import FastAPI, Depends, HTTPException, Response, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,7 +11,6 @@ from dotenv import load_dotenv
 from uuid import uuid4
 import time
 from pydantic import BaseModel
-import httpx
 from starlette import status
 from celery import Celery
 
@@ -20,11 +19,16 @@ from celery import Celery
 load_dotenv()
 
 # ---- Environment variables ----
+APP_ENV = os.getenv("APP_ENV", "development").lower()
 # Ensure GITHUB_TOKEN is set in your .env file
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
 # ---- Ollama API URL ----
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3:mini")
+OLLAMA_FALLBACK_MODELS = [
+    m.strip() for m in os.getenv("OLLAMA_FALLBACK_MODELS", "").split(",") if m.strip()
+]
 
 app = FastAPI()
 
@@ -38,6 +42,9 @@ class ChatRequest(BaseModel):
     message: str
     repo: str
     github_user: str
+    file: Optional[str] = None
+    file_content: Optional[str] = None
+    model: Optional[str] = None
 
 class ChatResponse(BaseModel):
     reply: str
@@ -61,7 +68,13 @@ def save_sessions():
 sessions = load_sessions()
 
 # ---- Cookie signing ----
-SECRET_KEY = os.getenv("SECRET_KEY", "super-secret")
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    if APP_ENV == "development":
+        SECRET_KEY = "dev-only-secret-change-me"
+        print("WARNING: SECRET_KEY is not set. Using an insecure development fallback.")
+    else:
+        raise RuntimeError("SECRET_KEY must be set when APP_ENV is not 'development'.")
 serializer = URLSafeSerializer(SECRET_KEY)
 
 # ---- CORS ----
@@ -78,6 +91,14 @@ GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
 GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
 
 
+def ensure_github_oauth_config():
+    if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=500,
+            detail="GitHub OAuth is not configured. Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET."
+        )
+
+
 # ---------- NEW: tiny in-memory TTL cache for GitHub responses ----------
 from functools import lru_cache
 from collections import defaultdict
@@ -87,6 +108,10 @@ from datetime import datetime, timedelta
 
 _CACHE: dict[str, tuple[float, dict | list | str | int]] = {}
 CACHE_TTL_SECONDS = 45  # short TTL to stay fresh
+_REPO_CONTEXT_CACHE: dict[str, tuple[float, dict]] = {}
+REPO_CONTEXT_TTL_SECONDS = 90
+_OLLAMA_MODELS_CACHE: tuple[float, list[str]] | None = None
+OLLAMA_MODELS_TTL_SECONDS = 30
 
 def cache_get(key: str):
     hit = _CACHE.get(key)
@@ -107,29 +132,30 @@ async def gh_get(url: str):
     if GITHUB_TOKEN:
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
 
-    # cache
     ck = f"gh:{url}"
     cached = cache_get(ck)
     if cached is not None:
         class _Resp:
             status_code = 200
             headers = {}
-            def json(self_nonlocal=cached): return cached
+            def json(self_nonlocal=cached):
+                return cached
         return _Resp()
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
         r = await c.get(url, headers=headers)
+        # If token is invalid/revoked, retry once without auth for public repos.
+        if r.status_code == 401 and GITHUB_TOKEN:
+            r = await c.get(url, headers={"Accept": "application/vnd.github.v3+json"})
 
     if r.status_code == 403 and r.headers.get("X-RateLimit-Remaining") == "0":
-        reset = r.headers.get("X-RateLimit-Reset")
         return JSONResponse(
-            {"reply": "⚠️ GitHub rate limit reached. Try again in a few minutes."},
+            {"reply": "GitHub rate limit reached. Try again in a few minutes."},
             status_code=429
         )
     r.raise_for_status()
     try:
-        j = r.json()
-        cache_set(ck, j)
+        cache_set(ck, r.json())
     except Exception:
         pass
     return r
@@ -155,6 +181,8 @@ def get_current_user(request: Request):
         if not session or session["expires"] < time.time():
             raise HTTPException(status_code=401, detail="Session expired")
         return session
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid session")
 
@@ -173,6 +201,7 @@ async def test_auth(user=Depends(get_current_user)):
 
 @app.get("/login/github")
 async def github_login():
+    ensure_github_oauth_config()
     state = os.urandom(16).hex()
     return RedirectResponse(
         f"https://github.com/login/oauth/authorize?"
@@ -181,6 +210,7 @@ async def github_login():
 
 @app.get("/auth/github/callback")
 async def github_callback(code: str, state: Optional[str] = None):
+    ensure_github_oauth_config()
     if not state:
         raise HTTPException(status_code=400, detail="Missing state parameter")
 
@@ -200,7 +230,6 @@ async def github_callback(code: str, state: Optional[str] = None):
 
         user_data = await get_github_user(token_data["access_token"])
 
-        # Create session
         session_id = str(uuid4())
         sessions[session_id] = {
             "access_token": token_data["access_token"],
@@ -210,34 +239,16 @@ async def github_callback(code: str, state: Optional[str] = None):
         }
         save_sessions()
 
-        # Store signed cookie
         signed_cookie = serializer.dumps({"session_id": session_id})
-        response = RedirectResponse(url="http://localhost:5173")  # frontend landing page
+        response = RedirectResponse(url="http://localhost:5173")
         response.set_cookie(
             key="session_id",
             value=signed_cookie,
             httponly=True,
-            samesite="Lax",       # helps avoid CSRF issues
-            secure=False,         # True if using https
-        
+            samesite="Lax",
+            secure=False,
         )
         return response
-    
-async def gh_get(url: str):
-    headers = {"Accept": "application/vnd.github.v3+json"}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"token {GITHUB_TOKEN}"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
-        r = await c.get(url, headers=headers)
-    # rate limit detection
-    if r.status_code == 403 and r.headers.get("X-RateLimit-Remaining") == "0":
-        reset = r.headers.get("X-RateLimit-Reset")
-        return JSONResponse(
-            {"reply": "⚠️ GitHub rate limit reached. Try again in a few minutes."},
-            status_code=429
-        )
-    r.raise_for_status()
-    return r
 
 async def get_repo_default_branch(owner: str, repo: str) -> str:
     r = await gh_get(f"https://api.github.com/repos/{owner}/{repo}")
@@ -290,19 +301,19 @@ async def get_readme_text(owner: str, repo: str) -> str | None:
 #             return ChatResponse(reply=f"{total} files in {req.github_user}/{req.repo}.", meta={"owner": req.github_user, "repo": req.repo})
 #         except HTTPException as e:
 #             if e.status_code == 429:
-#                 return ChatResponse(reply="⚠️ GitHub rate limit reached. Please try again later.")
+#                 return ChatResponse(reply="âš ï¸ GitHub rate limit reached. Please try again later.")
 #             raise
 #         except Exception as e:
-#             return ChatResponse(reply=f"⚠️ Failed to count files: {e}")
+#             return ChatResponse(reply=f"âš ï¸ Failed to count files: {e}")
 
-#     # 2) “What is this repo about?” → try README first, else LLM
+#     # 2) â€œWhat is this repo about?â€ â†’ try README first, else LLM
 #     if "what is this repo about" in msg or "explain this repo" in msg or "summary" in msg:
 #         try:
 #             readme = await get_readme_text(req.github_user, req.repo)
 #         except HTTPException as e:
 #             if e.status_code == 429:
-#                 return ChatResponse(reply="⚠️ GitHub rate limit reached. Please try again later.")
-#             return ChatResponse(reply=f"⚠️ GitHub error: {e.detail}")
+#                 return ChatResponse(reply="âš ï¸ GitHub rate limit reached. Please try again later.")
+#             return ChatResponse(reply=f"âš ï¸ GitHub error: {e.detail}")
 #         except Exception as e:
 #             readme = None
 
@@ -324,18 +335,18 @@ async def get_readme_text(owner: str, repo: str) -> str | None:
 #                                       json={"model": "phi3:mini", "prompt": prompt, "stream": False})
 #                 ai_res.raise_for_status()
 #                 ai = ai_res.json()
-#                 return ChatResponse(reply=ai.get("response", "").strip() or "⚠️ AI returned empty response.")
+#                 return ChatResponse(reply=ai.get("response", "").strip() or "âš ï¸ AI returned empty response.")
 #         except Exception as e:
-#             return ChatResponse(reply=f"⚠️ Could not reach AI backend: {e}")
+#             return ChatResponse(reply=f"âš ï¸ Could not reach AI backend: {e}")
         
-#     # 2b) “What is this repo about?” → try README first, else LLM
+#     # 2b) â€œWhat is this repo about?â€ â†’ try README first, else LLM
 #     if "what is this repo" in msg or "explain this repo" in msg or "summary" in msg:
 #         try:
 #             readme = await get_readme_text(req.github_user, req.repo)
 #         except HTTPException as e:
 #             if e.status_code == 429:
-#                 return ChatResponse(reply="⚠️ GitHub rate limit reached. Please try again later.")
-#             return ChatResponse(reply=f"⚠️ GitHub error: {e.detail}")
+#                 return ChatResponse(reply="âš ï¸ GitHub rate limit reached. Please try again later.")
+#             return ChatResponse(reply=f"âš ï¸ GitHub error: {e.detail}")
 #         except Exception as e:
 #             readme = None
 
@@ -348,7 +359,7 @@ async def get_readme_text(owner: str, repo: str) -> str | None:
 #             url = f"https://api.github.com/repos/{req.github_user}/{req.repo}/languages"
 #             r = await gh_get(url)
 #             if isinstance(r, JSONResponse):  # rate limited
-#                 return ChatResponse(reply="⚠️ GitHub rate limit reached. Please try again later.")
+#                 return ChatResponse(reply="âš ï¸ GitHub rate limit reached. Please try again later.")
             
 #             data = r.json()
 #             if not data:
@@ -363,10 +374,10 @@ async def get_readme_text(owner: str, repo: str) -> str | None:
 #                 meta={"languages": percentages}
 #             )
 #         except Exception as e:
-#             return ChatResponse(reply=f"⚠️ Failed to fetch languages: {e}")
+#             return ChatResponse(reply=f"âš ï¸ Failed to fetch languages: {e}")
 
 
-#     # 3) Generic fallback → LLM with minimal context
+#     # 3) Generic fallback â†’ LLM with minimal context
 #     prompt = f"Answer concisely:\n\nQ: {req.message}\nA:"
 #     try:
 #         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as c:
@@ -374,9 +385,9 @@ async def get_readme_text(owner: str, repo: str) -> str | None:
 #                                   json={"model": "phi3:mini", "prompt": prompt, "stream": False})
 #             ai_res.raise_for_status()
 #             ai = ai_res.json()
-#             return ChatResponse(reply=ai.get("response", "").strip() or "⚠️ AI returned empty response.")
+#             return ChatResponse(reply=ai.get("response", "").strip() or "âš ï¸ AI returned empty response.")
 #     except Exception as e:
-#         return ChatResponse(reply=f"⚠️ Could not reach AI backend: {e}")
+#         return ChatResponse(reply=f"âš ï¸ Could not reach AI backend: {e}")
 
 # ---------- NEW: extra GitHub helpers ----------
 async def get_repo_meta(owner: str, repo: str) -> dict:
@@ -400,59 +411,58 @@ async def get_languages(owner: str, repo: str) -> dict[str, int]:
     return data if isinstance(data, dict) else {}
 
 # ---------- NEW: build context to ground the LLM ----------
-async def build_repo_context(owner: str, repo: str, max_files: int = 30) -> dict:
-    context: dict = {"owner": owner, "repo": repo}
+async def build_repo_context(owner: str, repo: str, max_files: int = 12, include_readme: bool = False) -> dict:
+    ck = f"{owner}/{repo}:readme={int(include_readme)}:files={max_files}"
+    cached = _REPO_CONTEXT_CACHE.get(ck)
+    if cached and time.time() < cached[0]:
+        return cached[1]
 
-    # README (best-effort)
-    try:
-        readme = await get_readme_text(owner, repo)
-    except Exception:
-        readme = None
-    context["readme"] = (readme or "")[:3500]
+    context: dict = {"owner": owner, "repo": repo, "files": [], "dirs": [], "languages": {}, "readme": ""}
 
-    # top-level files (names only to keep small)
-    try:
-        items = await fetch_root_contents(owner, repo)
+    tasks = [
+        fetch_root_contents(owner, repo),
+        get_languages(owner, repo),
+        get_repo_meta(owner, repo),
+        get_contributors(owner, repo),
+    ]
+    if include_readme:
+        tasks.append(get_readme_text(owner, repo))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    items, langs, meta, contr = results[0], results[1], results[2], results[3]
+    readme = results[4] if include_readme and len(results) > 4 else None
+
+    if not isinstance(items, Exception):
         files = [it["path"] for it in items if it.get("type") == "file"]
         dirs = [it["path"] for it in items if it.get("type") == "dir"]
         context["files"] = files[:max_files]
         context["dirs"] = dirs[:max_files]
-    except Exception:
-        context["files"] = []
-        context["dirs"] = []
 
-    # languages
-    try:
-        langs = await get_languages(owner, repo)
+    if not isinstance(langs, Exception):
         total = sum(langs.values()) or 1
-        pct = {k: round(v * 100 / total, 2) for k, v in langs.items()}
-        context["languages"] = pct
-    except Exception:
-        context["languages"] = {}
+        context["languages"] = {k: round(v * 100 / total, 2) for k, v in langs.items()}
 
-    # meta (stars, license)
-    try:
-        meta = await get_repo_meta(owner, repo)
+    if not isinstance(meta, Exception):
         context["stars"] = meta.get("stargazers_count", 0)
         lic = meta.get("license") or {}
         context["license"] = lic.get("spdx_id") or lic.get("key") or ""
         context["description"] = meta.get("description") or ""
-    except Exception:
+    else:
         context["stars"] = 0
         context["license"] = ""
         context["description"] = ""
 
-    # contributors (count only)
-    try:
-        contr = await get_contributors(owner, repo)
-        context["contributors_count"] = len(contr)
-    except Exception:
-        context["contributors_count"] = 0
+    context["contributors_count"] = 0 if isinstance(contr, Exception) else len(contr)
+    context["readme"] = "" if isinstance(readme, Exception) or not readme else str(readme)[:1000]
 
+    _REPO_CONTEXT_CACHE[ck] = (time.time() + REPO_CONTEXT_TTL_SECONDS, context)
     return context
 
 # ---------- NEW: smarter intent detection ----------
 INTENT_PATTERNS = [
+    ("summarize_file", r"\b(explain|summarize|describe|what does)\b.*\b(file|code)\b"),
+    ("repo_structure", r"\b(file structure|folder structure|project structure|repo structure|directory structure|tree)\b"),
+    ("list_files", r"\b(list|show|display|what are)\b.*\b(files|file list)\b|\bfiles in (this|the) repo\b"),
     ("get_languages", r"\b(language|languages|language breakdown)\b"),
     ("count_files", r"\b(how many|number of)\s+files\b|\bcount files\b"),
     ("get_stars", r"\b(stars?|stargazers?)\b"),
@@ -466,24 +476,65 @@ def detect_intent(msg: str) -> str:
     for intent, pat in INTENT_PATTERNS:
         if re.search(pat, text):
             return intent
-    return "freeform"  # <— anything else goes to LLM (ChatGPT-like)
+    return "freeform"  # <â€” anything else goes to LLM (ChatGPT-like)
+
+async def get_ollama_models() -> list[str]:
+    global _OLLAMA_MODELS_CACHE
+    if _OLLAMA_MODELS_CACHE and time.time() < _OLLAMA_MODELS_CACHE[0]:
+        return _OLLAMA_MODELS_CACHE[1]
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            res = await c.get(f"{OLLAMA_URL}/api/tags")
+            res.raise_for_status()
+            payload = res.json()
+            models = [m.get("name", "") for m in payload.get("models", []) if m.get("name")]
+            _OLLAMA_MODELS_CACHE = (time.time() + OLLAMA_MODELS_TTL_SECONDS, models)
+            return models
+    except Exception:
+        return []
 
 # ---------- NEW: robust LLM call with system-style instruction ----------
-async def call_llm(prompt: str) -> str:
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as c:
-            res = await c.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": "phi3:mini",
-                    "prompt": prompt,
-                    "stream": False,
-                },
-            )
+async def call_llm(prompt: str, requested_model: Optional[str] = None) -> str:
+    installed = await get_ollama_models()
+
+    # Priority: request model -> configured default -> configured fallbacks -> installed models
+    candidates: list[str] = []
+    for m in [requested_model, OLLAMA_MODEL, *OLLAMA_FALLBACK_MODELS, *installed]:
+        if m and m not in candidates:
+            candidates.append(m)
+    if not candidates:
+        candidates = [OLLAMA_MODEL]
+
+    errors: list[str] = []
+    for model_name in candidates:
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as c:
+                res = await c.post(
+                    f"{OLLAMA_URL}/api/generate",
+                    json={
+                        "model": model_name,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"num_predict": 220, "temperature": 0.2},
+                    },
+                )
+            if res.status_code == 404:
+                errors.append(f"{model_name}: not found")
+                continue
             res.raise_for_status()
-            return (res.json().get("response") or "").strip() or "I’m not sure."
-    except Exception as e:
-        return f"⚠️ Could not reach AI backend: {e}"
+            answer = (res.json().get("response") or "").strip()
+            if answer:
+                return answer
+            errors.append(f"{model_name}: empty response")
+        except httpx.ReadTimeout:
+            errors.append(f"{model_name}: timeout")
+        except httpx.ConnectError:
+            return f"Could not reach AI backend at {OLLAMA_URL}. Ensure Ollama is running."
+        except Exception as e:
+            errors.append(f"{model_name}: {repr(e)}")
+
+    return "AI generation failed after model fallbacks: " + " | ".join(errors[:3])
 
 def format_context_block(ctx: dict) -> str:
     lines = []
@@ -497,11 +548,11 @@ def format_context_block(ctx: dict) -> str:
         langs = ", ".join([f"{k} {v}%" for k, v in ctx["languages"].items()])
         lines.append(f"Languages: {langs}")
     if ctx.get("files"):
-        lines.append("Top-level files:\n" + "\n".join(f"- {f}" for f in ctx["files"][:20]))
+        lines.append("Top-level files:\n" + "\n".join(f"- {f}" for f in ctx["files"][:10]))
     if ctx.get("dirs"):
-        lines.append("Top-level directories:\n" + "\n".join(f"- {d}" for d in ctx["dirs"][:20]))
+        lines.append("Top-level directories:\n" + "\n".join(f"- {d}" for d in ctx["dirs"][:10]))
     if ctx.get("readme"):
-        lines.append("README excerpt:\n" + ctx["readme"][:1200])
+        lines.append("README excerpt:\n" + ctx["readme"][:600])
     return "\n\n".join(lines)
 
 
@@ -514,21 +565,26 @@ async def chat(req: ChatRequest):
 
     intent = detect_intent(msg)
 
-    # 1) Structured intents → GitHub API (deterministic answers)
+    # 1) Structured intents â†’ GitHub API (deterministic answers)
     try:
         if intent == "summarize_file":
             if not req.file_content:
-                return ChatResponse(reply="⚠️ To explain a file, please select one first.", meta={"grounded": False})
-        
+                return ChatResponse(reply="âš ï¸ To explain a file, please select one first.", meta={"grounded": False})
+
+            # Large files (especially notebooks) can time out local models.
+            max_chars = 12000
+            file_body = req.file_content[:max_chars]
+            truncated = len(req.file_content) > max_chars
             prompt = (
                 "You are a helpful software assistant. "
                 "Explain the code below clearly and concisely. "
                 "Highlight its purpose, key functions, and overall structure.\n\n"
                 f"File: `{req.file}`\n\n"
-                f"Code:\n```\n{req.file_content}\n```\n\n"
-                "Explanation:"
+                f"Code:\n```\n{file_body}\n```\n\n"
+                + ("Note: The file content was truncated for speed.\n\n" if truncated else "")
+                + "Explanation:"
             )
-            ans = await call_llm(prompt)
+            ans = await call_llm(prompt, req.model)
             return ChatResponse(reply=ans, sources=[req.file], meta={"grounded": True})
 
         if intent == "get_languages":
@@ -539,6 +595,35 @@ async def chat(req: ChatRequest):
             pct = {k: round(v * 100 / total, 2) for k, v in langs.items()}
             breakdown = ", ".join(f"{k} ({v}%)" for k, v in pct.items())
             return ChatResponse(reply=f"Languages in {req.repo}: {breakdown}", meta={"languages": pct})
+
+        if intent == "repo_structure":
+            items = await fetch_root_contents(req.github_user, req.repo)
+            files = [x["path"] for x in items if x.get("type") == "file"]
+            dirs = [x["path"] for x in items if x.get("type") == "dir"]
+            sample = (dirs[:12] + files[:12])[:20]
+            if not sample:
+                return ChatResponse(reply=f"I could not find visible root items for {req.github_user}/{req.repo}.")
+            listing = "\n".join(f"- {p}" for p in sample)
+            return ChatResponse(
+                reply=(
+                    f"Root structure for {req.github_user}/{req.repo}:\n"
+                    f"- Directories: {len(dirs)}\n"
+                    f"- Files: {len(files)}\n"
+                    f"{listing}"
+                ),
+                meta={"dirs": len(dirs), "files": len(files), "grounded": True},
+            )
+
+        if intent == "list_files":
+            items = await fetch_root_contents(req.github_user, req.repo)
+            files = [x["path"] for x in items if x.get("type") == "file"]
+            if not files:
+                return ChatResponse(reply=f"No root-level files found in {req.github_user}/{req.repo}.", meta={"grounded": True})
+            listing = "\n".join(f"- {p}" for p in files[:40])
+            return ChatResponse(
+                reply=f"Root files in {req.github_user}/{req.repo}:\n{listing}",
+                meta={"files_returned": min(len(files), 40), "total_root_files": len(files), "grounded": True},
+            )
 
         if intent == "count_files":
             # count **all** files via git trees API (more impressive than root only)
@@ -554,7 +639,7 @@ async def chat(req: ChatRequest):
         if intent == "get_stars":
             meta = await get_repo_meta(req.github_user, req.repo)
             stars = meta.get("stargazers_count", 0)
-            return ChatResponse(reply=f"{req.repo} has ⭐ {stars} stars.", meta={"stars": stars})
+            return ChatResponse(reply=f"{req.repo} has â­ {stars} stars.", meta={"stars": stars})
 
         if intent == "get_repo_name":
             return ChatResponse(reply=f"The name of this repository is **{req.repo}**.")
@@ -565,39 +650,45 @@ async def chat(req: ChatRequest):
 
     except HTTPException as e:
         if e.status_code == 429:
-            return ChatResponse(reply="⚠️ GitHub rate limit reached. Please try again later.")
-        return ChatResponse(reply=f"⚠️ GitHub error: {e.detail}")
+            return ChatResponse(reply="âš ï¸ GitHub rate limit reached. Please try again later.")
+        return ChatResponse(reply=f"âš ï¸ GitHub error: {e.detail}")
     except Exception as e:
-        # Don’t block — we’ll still try LLM with context
+        # Donâ€™t block â€” weâ€™ll still try LLM with context
         pass
 
-    # 2) Repo-related open questions → LLM grounded with context
+    # 2) Repo-related open questions â†’ LLM grounded with context
     if intent == "summarize_repo":
-        ctx = await build_repo_context(req.github_user, req.repo)
+        ctx = await build_repo_context(req.github_user, req.repo, include_readme=True)
         ctx_block = format_context_block(ctx)
         prompt = (
             "You are a helpful software assistant. Use the provided repository context when relevant. "
-            "If the context is weak or missing details, say what you’re unsure about.\n\n"
+            "If the context is weak or missing details, say what youâ€™re unsure about.\n\n"
             f"User question:\n{msg}\n\n"
             f"Repository context:\n{ctx_block}\n\n"
             "Answer clearly and concisely."
         )
-        ans = await call_llm(prompt)
+        ans = await call_llm(prompt, req.model)
         return ChatResponse(reply=ans, sources=[], meta={"grounded": True})
 
-    # 3) Anything else (general world questions, arbitrary chat) → ChatGPT-like
-    #    Still include repo context in case it helps, but don’t force it.
-    ctx = await build_repo_context(req.github_user, req.repo)
+    # 3) Anything else (general world questions, arbitrary chat) â†’ ChatGPT-like
+    #    Still include repo context in case it helps, but donâ€™t force it.
+    ctx = await build_repo_context(req.github_user, req.repo, include_readme=False)
+    repo_signal = re.search(r"\b(repo|repository|project|file|folder|directory|codebase|this repo)\b", msg.lower())
+    if repo_signal and not (ctx.get("files") or ctx.get("dirs") or ctx.get("readme")):
+        return ChatResponse(
+            reply=f"I couldn't fetch repository context for {req.github_user}/{req.repo} right now, so I can't give a grounded answer yet.",
+            meta={"grounded": False},
+        )
     ctx_block = format_context_block(ctx)
     prompt = (
-        "You are a helpful assistant. If the question is about the repository, ground your answer in the context below. "
-        "If the question is general knowledge (e.g., tech history, concepts), just answer normally. "
-        "Never say 'unsupported query'. If you are unsure, state uncertainty briefly.\n\n"
+        "You are a helpful assistant. If the question is about the repository, you MUST use the repository context below. "
+        "Do not give generic textbook answers when repository context exists. Mention concrete files/directories from context. "
+        "If the context is insufficient, say exactly what is missing.\n\n"
         f"User question:\n{msg}\n\n"
         f"Repository context (optional):\n{ctx_block}\n\n"
         "Answer:"
     )
-    ans = await call_llm(prompt)
+    ans = await call_llm(prompt, req.model)
     return ChatResponse(reply=ans, sources=[], meta={"grounded": False})
 
 @app.get("/health")
@@ -618,6 +709,17 @@ async def health():
     except Exception as e:
         probs.append(f"ollama: {e}")
     return {"ok": len(probs)==0, "problems": probs}
+
+@app.get("/api/ai-status")
+async def ai_status():
+    models = await get_ollama_models()
+    return {
+        "ollama_url": OLLAMA_URL,
+        "default_model": OLLAMA_MODEL,
+        "fallback_models": OLLAMA_FALLBACK_MODELS,
+        "available_models": models,
+        "ok": len(models) > 0,
+    }
 
     
 @app.get("/me")
@@ -640,7 +742,7 @@ async def get_github_repos(username: str):
         elif response.status_code != 200:
             raise HTTPException(status_code=response.status_code, detail="Error fetching repositories")
         
-        return response.json()  # ✅ send everything back
+        return response.json()  # âœ… send everything back
 
     
 @app.get("/repos/{owner}/{repo}/languages")
@@ -656,26 +758,86 @@ async def get_repo_languages(owner: str, repo: str):
             return {"languages": {}, "percentages": {}}
         percentages = {lang: round((size / total) * 100, 2) for lang, size in data.items()}
         return {"languages": data, "percentages": percentages}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch languages: {e}")
     
 @app.get("/repos/{owner}/{repo}/files")
-async def get_repo_files(owner: str, repo: str, path: str = ""):
+async def get_repo_files(owner: str, repo: str, path: str = "", recursive: bool = False):
     """
     Fetch the file/directory structure of a repository.
     By default, lists the root. You can pass ?path=subdir to drill deeper.
     """
+    if recursive:
+        try:
+            default_branch = await get_repo_default_branch(owner, repo)
+            r = await gh_get(f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}?recursive=1")
+            if isinstance(r, JSONResponse):
+                raise HTTPException(status_code=429, detail="GitHub rate limit reached")
+            payload = r.json()
+            tree = payload.get("tree", [])
+
+            base = (path or "").strip("/")
+            normalized = []
+            for item in tree:
+                item_path = (item.get("path") or "").strip("/")
+                if not item_path:
+                    continue
+                if base and not (item_path == base or item_path.startswith(base + "/")):
+                    continue
+                out_path = item_path[len(base) + 1:] if base and item_path.startswith(base + "/") else item_path
+                if not out_path:
+                    continue
+                if item.get("type") == "tree":
+                    out_type = "dir"
+                elif item.get("type") == "blob":
+                    out_type = "file"
+                else:
+                    continue
+                normalized.append(
+                    {
+                        "type": out_type,
+                        "path": out_path,
+                        "size": item.get("size"),
+                        "download_url": None,
+                    }
+                )
+            return normalized
+        except HTTPException:
+            raise
+        except Exception:
+            # Graceful fallback to root listing if recursive tree API fails.
+            pass
+
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+
     try:
-        r = await gh_get(url)
-        if isinstance(r, JSONResponse):  # rate limited
-            raise HTTPException(status_code=429, detail="Rate limited")
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            r = await client.get(url, headers=headers)
+            # Retry unauthenticated when token is bad.
+            if r.status_code == 401 and GITHUB_TOKEN:
+                r = await client.get(url, headers={"Accept": "application/vnd.github.v3+json"})
+
+        if r.status_code == 403 and r.headers.get("X-RateLimit-Remaining") == "0":
+            raise HTTPException(status_code=429, detail="GitHub rate limit reached")
+        if r.status_code == 409:
+            # Empty repository on GitHub
+            return []
+        if r.status_code == 404:
+            raise HTTPException(status_code=404, detail="Repository or path not found")
+        if r.status_code >= 400:
+            detail = ""
+            try:
+                detail = r.json().get("message", "")
+            except Exception:
+                detail = r.text
+            raise HTTPException(status_code=r.status_code, detail=detail or "Failed to fetch repository files")
 
         data = r.json()
-        if isinstance(data, dict) and data.get("message"):  # GitHub error response
-            raise HTTPException(status_code=400, detail=data.get("message"))
-
-        # Normalize: only keep type + path (and optionally size/url)
         tree = [
             {
                 "type": item.get("type"),
@@ -686,18 +848,20 @@ async def get_repo_files(owner: str, repo: str, path: str = ""):
             for item in (data if isinstance(data, list) else [data])
         ]
         return tree
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch repo files: {e}")
 
 
 
 @app.post("/logout")
-async def logout(response: Response, user=Depends(get_current_user)):
+async def logout(request: Request, user=Depends(get_current_user)):
     session_id = None
-    cookie = response.set_cookie
     try:
-        # extract the real session_id from signed cookie
-        session_id = serializer.loads(user["session_id"])["session_id"]
+        cookie = request.cookies.get("session_id")
+        if cookie:
+            session_id = serializer.loads(cookie)["session_id"]
     except Exception:
         pass
 
@@ -715,21 +879,33 @@ async def logout(response: Response, user=Depends(get_current_user)):
 async def get_file_content(owner: str, repo: str, path: str):
     """Fetches the raw content of a specific file from a GitHub repository."""
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-    headers = {"Accept": "application/vnd.github.v3.raw"} # Request raw content
+    headers = {"Accept": "application/vnd.github.v3.raw"}
     
     # Add your GitHub token for authentication and higher rate limits
-    if os.getenv("GITHUB_TOKEN"):
-        headers["Authorization"] = f"token {os.getenv('GITHUB_TOKEN')}"
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
     
     try:
-        # Use an asynchronous client from httpx to make the non-blocking request
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
             res = await client.get(url, headers=headers)
-            res.raise_for_status() # Raise an exception for bad status codes
-            
+            # Retry without auth if token is invalid/revoked; works for public repos.
+            if res.status_code == 401 and GITHUB_TOKEN:
+                res = await client.get(url, headers={"Accept": "application/vnd.github.v3.raw"})
+
+        if res.status_code == 404:
+            raise HTTPException(status_code=404, detail="File not found in repository.")
+        if res.status_code == 409:
+            raise HTTPException(status_code=409, detail="Repository is empty.")
+        if res.status_code >= 400:
+            detail = ""
+            try:
+                detail = res.json().get("message", "")
+            except Exception:
+                detail = res.text
+            raise HTTPException(status_code=res.status_code, detail=detail or "Failed to fetch file content.")
+
         return Response(content=res.text, media_type="text/plain")
     except httpx.HTTPStatusError as e:
-        # Handle HTTP status errors (e.g., 404, 403) from httpx
         print(f"Error fetching file content: {e}")
         raise HTTPException(
             status_code=e.response.status_code,
@@ -751,17 +927,18 @@ class ChatQuery(BaseModel):
     github_user: str
     file: Optional[str] = None
     file_content: Optional[str] = None
+    model: Optional[str] = None
 
 @app.post("/api/chat-async", status_code=status.HTTP_202_ACCEPTED)
 async def chat_async(query: ChatQuery):
     # This is the endpoint that the frontend calls
     print(f"Received query: '{query.message}' for repo: {query.repo}")
 
-    # Offload the heavy work to a Celery worker
-    task = process_chat_query.delay(query.message, query.repo, query.github_user, query.file, query.file_content)
-
-    # Return the task ID immediately so the frontend doesn't hang
-    return {"task_id": task.id}
+    try:
+        task = process_chat_query.delay(query.message, query.repo, query.github_user, query.file, query.file_content)
+        return {"task_id": task.id}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Async worker unavailable: {e}")
 
 # --- Celery Configuration ---
 # Celery instance that will be used to run tasks
@@ -821,8 +998,5 @@ async def get_task_status(task_id: str):
 # 3. Use managed services like Vertex AI Vector Search for your database and Vertex AI Endpoints for LLM serving[cite: 417, 422].
 
 
-import requests
-url = "https://api.github.com/repos/SHRAVANIRANE/codescribeAI-coding-assistant/contents"
-res = requests.get(url)
-print(res.status_code)
-print(res.json()[:2])  # show first 2 files
+
+

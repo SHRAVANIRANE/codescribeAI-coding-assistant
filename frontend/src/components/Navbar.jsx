@@ -21,7 +21,7 @@ export default function Navbar() {
         const data = await res.json();
         setUser(data);
         localStorage.setItem("githubUser", JSON.stringify(data));
-      } catch (err) {
+      } catch {
         console.log("No user logged in yet");
       }
     }

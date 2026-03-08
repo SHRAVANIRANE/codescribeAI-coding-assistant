@@ -1,52 +1,52 @@
-# 🚀 CodeScribeAI
+﻿# ðŸš€ CodeScribeAI
 
-🚧 Note: The Project is in development
+ðŸš§ Note: The Project is in development
 <br>
 **CodeScribeAI** is an AI-powered coding assistant that helps you **explore, debug, and understand code** effortlessly.  
-Built with **React**, **Node.js**, and **Ollama LLM**, it’s designed to boost developer productivity and make coding more intuitive.  
+Built with **React**, **Node.js**, and **Ollama LLM**, itâ€™s designed to boost developer productivity and make coding more intuitive.  
 
 ---
 
-## ✨ Features
+## âœ¨ Features
 
-- 🤖 **AI-Powered Assistance** – Get instant explanations, debugging help, and code insights.  
-- 📂 **File Analysis** – Upload or select files for detailed breakdowns.  
-- 💡 **Smart Suggestions** – Improve your code with AI-driven recommendations.  
-- 🎨 **Clean UI** – Minimal and distraction-free interface built with React + Tailwind.  
-- 🛠️ **Extensible Backend** – Node.js + Express API with modular routes.  
-- 🔒 **In Progress** – Actively being developed with new features coming soon!  
+- ðŸ¤– **AI-Powered Assistance** â€“ Get instant explanations, debugging help, and code insights.  
+- ðŸ“‚ **File Analysis** â€“ Upload or select files for detailed breakdowns.  
+- ðŸ’¡ **Smart Suggestions** â€“ Improve your code with AI-driven recommendations.  
+- ðŸŽ¨ **Clean UI** â€“ Minimal and distraction-free interface built with React + Tailwind.  
+- ðŸ› ï¸ **Extensible Backend** â€“ Node.js + Express API with modular routes.  
+- ðŸ”’ **In Progress** â€“ Actively being developed with new features coming soon!  
 
 ---
 
-## 🛠️ Tech Stack
+## ðŸ› ï¸ Tech Stack
 
 **Frontend**  
-- ⚛️ React  
-- 🎨 Tailwind CSS  
-- 🔄 React Router  
-- ✨ GSAP (animations)  
+- âš›ï¸ React  
+- ðŸŽ¨ Tailwind CSS  
+- ðŸ”„ React Router  
+- âœ¨ GSAP (animations)  
 
 **Backend**  
-- 🟢 Node.js + Express  
-- 🗄️ MySQL2 (with SSL for DigitalOcean)  
-- 📦 Multer (file uploads)  
-- 📧 Nodemailer (email handling)  
+- ðŸŸ¢ Node.js + Express  
+- ðŸ—„ï¸ MySQL2 (with SSL for DigitalOcean)  
+- ðŸ“¦ Multer (file uploads)  
+- ðŸ“§ Nodemailer (email handling)  
 
 **AI**  
-- 🧠 [Ollama](https://ollama.ai) – Local LLM integration  
+- ðŸ§  [Ollama](https://ollama.ai) â€“ Local LLM integration  
 
 ---
 
-## 🚀 Getting Started
+## ðŸš€ Getting Started
 
 Follow these steps to set up CodeScribeAI locally:
 
-### 1️⃣ Clone the Repository
+### 1ï¸âƒ£ Clone the Repository
 ```bash
 git clone https://github.com/your-username/codescribeAI.git
 cd codescribeAI
 ```
-### 2️⃣ Install Dependencies
+### 2ï¸âƒ£ Install Dependencies
 ```bash
 Frontend:
 cd frontend
@@ -56,16 +56,23 @@ cd backend
 npm install
 ```
 ### 3️⃣ Configure Environment
-Create .env files in both frontend/ and backend/ with required configs:
-backend .env
+Copy `.env.example` to `.env` and fill values:
 ```bash
-GITHUB_CLIENT_ID= github_client_id
-GITHUB_CLIENT_SECRET= github_client_secret
-GITHUB_TOKEN= github_token
-OLLAMA_URL= ollama_url
-
+cp .env.example .env
 ```
-### 4️⃣ Run the Project
+Required values:
+```bash
+APP_ENV=development
+SECRET_KEY=replace-with-a-long-random-string
+GITHUB_CLIENT_ID=your_github_client_id
+GITHUB_CLIENT_SECRET=your_github_client_secret
+GITHUB_TOKEN=your_github_token
+OLLAMA_URL=http://127.0.0.1:11434
+```
+Security notes:
+- Never commit `.env` to git.
+- Rotate secrets immediately if they were ever shared.
+### 4ï¸âƒ£ Run the Project
 Start backend:
 ```bash
 cd backend
@@ -77,7 +84,7 @@ npm run dev
 
 ---
 
-## 📌 Roadmap
+## ðŸ“Œ Roadmap
  AI-powered debugging suggestions
 
  Multi-file context awareness
@@ -88,7 +95,7 @@ npm run dev
 
  Authentication & user profiles
 
-## 🤝 Contributing
+## ðŸ¤ Contributing
 Contributions are welcome!
 
 Fork the repo
@@ -99,14 +106,15 @@ Commit changes (git commit -m "Add feature")
 
 Push to your branch (git push origin feature-name)
 
-Open a Pull Request 🎉
+Open a Pull Request ðŸŽ‰
 
-## 📜 License
+## ðŸ“œ License
 This project is licensed under the MIT License.
 See the LICENSE file for details.
 
-## 🌟 Support
-If you like this project, please consider giving it a ⭐ on GitHub – it helps a lot!
+## ðŸŒŸ Support
+If you like this project, please consider giving it a â­ on GitHub â€“ it helps a lot!
 
-## 📸 Screenshots (Coming Soon)
+## ðŸ“¸ Screenshots (Coming Soon)
+
 
