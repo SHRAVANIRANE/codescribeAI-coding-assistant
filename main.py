@@ -1,6 +1,7 @@
 ﻿import json
 import os
 import asyncio
+import logging
 from fastapi import FastAPI, Depends, HTTPException, Response, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,8 +30,14 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3:mini")
 OLLAMA_FALLBACK_MODELS = [
     m.strip() for m in os.getenv("OLLAMA_FALLBACK_MODELS", "").split(",") if m.strip()
 ]
-
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
+COOKIE_SECURE = APP_ENV != "development"
+COOKIE_SAMESITE = "Lax" if APP_ENV == "development" else "Strict"
 app = FastAPI()
+logger = logging.getLogger("codescribe")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # ---- Session persistence ----
 SESSIONS_FILE = "sessions.json"
@@ -86,6 +93,15 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
+@app.middleware("http")
+async def add_request_context(request: Request, call_next):
+    req_id = request.headers.get("x-request-id") or str(uuid4())
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    response.headers["X-Request-ID"] = req_id
+    logger.info("%s %s -> %s (%sms) req_id=%s", request.method, request.url.path, response.status_code, elapsed_ms, req_id)
+    return response
 # ---- Env vars ----
 GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
 GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
@@ -97,6 +113,20 @@ def ensure_github_oauth_config():
             status_code=500,
             detail="GitHub OAuth is not configured. Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET."
         )
+
+
+def validate_oauth_state(request: Request, state: Optional[str]):
+    if not state:
+        raise HTTPException(status_code=400, detail="Missing state parameter")
+    signed_state = request.cookies.get("oauth_state")
+    if not signed_state:
+        raise HTTPException(status_code=400, detail="Missing OAuth state cookie")
+    try:
+        expected_state = serializer.loads(signed_state).get("state")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid OAuth state cookie")
+    if expected_state != state:
+        raise HTTPException(status_code=400, detail="OAuth state mismatch")
 
 
 # ---------- NEW: tiny in-memory TTL cache for GitHub responses ----------
@@ -203,13 +233,24 @@ async def test_auth(user=Depends(get_current_user)):
 async def github_login():
     ensure_github_oauth_config()
     state = os.urandom(16).hex()
-    return RedirectResponse(
+    response = RedirectResponse(
         f"https://github.com/login/oauth/authorize?"
         f"client_id={GITHUB_CLIENT_ID}&state={state}&scope=repo,user"
     )
+    response.set_cookie(
+        key="oauth_state",
+        value=serializer.dumps({"state": state}),
+        httponly=True,
+        samesite=COOKIE_SAMESITE,
+        secure=COOKIE_SECURE,
+        max_age=300,
+    )
+    return response
 
 @app.get("/auth/github/callback")
-async def github_callback(code: str, state: Optional[str] = None):
+async def github_callback(request: Request, code: str, state: Optional[str] = None):
+    ensure_github_oauth_config()
+    validate_oauth_state(request, state)
     ensure_github_oauth_config()
     if not state:
         raise HTTPException(status_code=400, detail="Missing state parameter")
@@ -235,19 +276,21 @@ async def github_callback(code: str, state: Optional[str] = None):
             "access_token": token_data["access_token"],
             "user": user_data["login"],
             "user_id": user_data["id"],
-            "expires": time.time() + 3600
+            "expires": time.time() + SESSION_TTL_SECONDS
         }
         save_sessions()
 
         signed_cookie = serializer.dumps({"session_id": session_id})
-        response = RedirectResponse(url="http://localhost:5173")
+        response = RedirectResponse(url=FRONTEND_URL)
         response.set_cookie(
             key="session_id",
             value=signed_cookie,
             httponly=True,
-            samesite="Lax",
-            secure=False,
+            samesite=COOKIE_SAMESITE,
+            secure=COOKIE_SECURE,
+            max_age=SESSION_TTL_SECONDS,
         )
+        response.delete_cookie("oauth_state", samesite=COOKIE_SAMESITE, secure=COOKIE_SECURE)
         return response
 
 async def get_repo_default_branch(owner: str, repo: str) -> str:
@@ -872,7 +915,7 @@ async def logout(request: Request, user=Depends(get_current_user)):
 
     # Clear cookie
     response = JSONResponse({"message": "Logged out"})
-    response.delete_cookie("session_id")
+    response.delete_cookie("session_id", samesite=COOKIE_SAMESITE, secure=COOKIE_SECURE)
     return response
 
 @app.get("/repos/{owner}/{repo}/file-content")
@@ -996,6 +1039,16 @@ async def get_task_status(task_id: str):
 # 1. Containerize the application and Celery worker using Docker[cite: 347, 348, 349].
 # 2. Deploy it to a platform like Google Kubernetes Engine (GKE)[cite: 373, 374, 375].
 # 3. Use managed services like Vertex AI Vector Search for your database and Vertex AI Endpoints for LLM serving[cite: 417, 422].
+
+
+
+
+
+
+
+
+
+
 
 
 
