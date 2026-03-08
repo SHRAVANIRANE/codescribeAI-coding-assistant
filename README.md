@@ -1,4 +1,4 @@
-﻿# CodeScribeAI
+﻿# 🤖 CodeScribeAI
 
 CodeScribeAI is a local-first coding assistant with:
 - FastAPI backend
