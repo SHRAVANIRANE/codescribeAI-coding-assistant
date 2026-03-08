@@ -46,7 +46,7 @@ export default function ChatInterface({
     });
 
   return (
-    <div className="flex-1 flex flex-col bg-gradient-to-br from-gray-900 to-gray-800 rounded-xl shadow-lg border border-gray-700">
+    <div className="flex-1 min-h-0 flex flex-col bg-gradient-to-br from-gray-900 to-gray-800 rounded-xl shadow-lg border border-gray-700">
       {selectedRepo && (
         <div className="mb-2 bg-gray-800 px-4 py-2 rounded-lg text-gray-300 border-b border-gray-700 text-sm">
           Chatting about:{" "}
@@ -56,7 +56,7 @@ export default function ChatInterface({
         </div>
       )}
 
-      <div className="flex-1 overflow-y-auto max-h-screen space-y-4 p-4 pr-2 custom-scrollbar">
+      <div className="flex-1 min-h-0 overflow-y-auto space-y-4 p-4 pr-2 custom-scrollbar">
         {messages.map((msg, idx) => (
           <div
             key={idx}
