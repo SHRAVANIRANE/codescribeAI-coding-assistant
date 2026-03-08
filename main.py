@@ -667,11 +667,11 @@ async def chat(req: ChatRequest):
 
     intent = detect_intent(msg)
 
-    # 1) Structured intents â†’ GitHub API (deterministic answers)
+    # 1) Structured intents -> GitHub API (deterministic answers)
     try:
         if intent == "summarize_file":
             if not req.file_content:
-                return ChatResponse(reply="âš ï¸ To explain a file, please select one first.", meta={"grounded": False})
+                return ChatResponse(reply="[WARN] To explain a file, please select one first.", meta={"grounded": False})
 
             # Large files (especially notebooks) can time out local models.
             max_chars = 12000
@@ -741,7 +741,7 @@ async def chat(req: ChatRequest):
         if intent == "get_stars":
             meta = await get_repo_meta(req.github_user, req.repo)
             stars = meta.get("stargazers_count", 0)
-            return ChatResponse(reply=f"{req.repo} has â­ {stars} stars.", meta={"stars": stars})
+            return ChatResponse(reply=f"{req.repo} has * {stars} stars.", meta={"stars": stars})
 
         if intent == "get_repo_name":
             return ChatResponse(reply=f"The name of this repository is **{req.repo}**.")
@@ -752,19 +752,19 @@ async def chat(req: ChatRequest):
 
     except HTTPException as e:
         if e.status_code == 429:
-            return ChatResponse(reply="âš ï¸ GitHub rate limit reached. Please try again later.")
-        return ChatResponse(reply=f"âš ï¸ GitHub error: {e.detail}")
+            return ChatResponse(reply="[WARN] GitHub rate limit reached. Please try again later.")
+        return ChatResponse(reply=f"[WARN] GitHub error: {e.detail}")
     except Exception as e:
-        # Donâ€™t block â€” weâ€™ll still try LLM with context
+        # Do not block; still try LLM with context
         pass
 
-    # 2) Repo-related open questions â†’ LLM grounded with context
+    # 2) Repo-related open questions -> LLM grounded with context
     if intent == "summarize_repo":
         ctx = await build_repo_context(req.github_user, req.repo, include_readme=True)
         ctx_block = format_context_block(ctx)
         prompt = (
             "You are a helpful software assistant. Use the provided repository context when relevant. "
-            "If the context is weak or missing details, say what youâ€™re unsure about.\n\n"
+            "If the context is weak or missing details, say what you're unsure about.\n\n"
             f"User question:\n{msg}\n\n"
             f"Repository context:\n{ctx_block}\n\n"
             "Answer clearly and concisely."
@@ -772,8 +772,8 @@ async def chat(req: ChatRequest):
         ans = await call_llm(prompt, req.model)
         return ChatResponse(reply=ans, sources=[], meta={"grounded": True})
 
-    # 3) Anything else (general world questions, arbitrary chat) â†’ ChatGPT-like
-    #    Still include repo context in case it helps, but donâ€™t force it.
+    # 3) Anything else (general world questions, arbitrary chat) -> ChatGPT-like
+    #    Still include repo context in case it helps, but do not force it.
     ctx = await build_repo_context(req.github_user, req.repo, include_readme=False)
     repo_signal = re.search(r"\b(repo|repository|project|file|folder|directory|codebase|this repo)\b", msg.lower())
     if repo_signal and not (ctx.get("files") or ctx.get("dirs") or ctx.get("readme")):

@@ -1,120 +1,126 @@
-﻿# ðŸš€ CodeScribeAI
+﻿# CodeScribeAI
 
-ðŸš§ Note: The Project is in development
-<br>
-**CodeScribeAI** is an AI-powered coding assistant that helps you **explore, debug, and understand code** effortlessly.  
-Built with **React**, **Node.js**, and **Ollama LLM**, itâ€™s designed to boost developer productivity and make coding more intuitive.  
+CodeScribeAI is a local-first coding assistant with:
+- FastAPI backend
+- React + Vite frontend
+- GitHub repository analysis
+- Ollama-powered AI responses
 
----
+## Current Architecture
+- Backend: `main.py` (FastAPI)
+- Frontend: `frontend/` (React, Vite)
+- Session store: SQLite (`sessions.db`)
+- Optional async workers: Celery + Redis
 
-## âœ¨ Features
+## Prerequisites
+- Python 3.10+
+- Node.js 18+
+- Ollama installed and running
+- (Optional) Redis for async chat endpoints
 
-- ðŸ¤– **AI-Powered Assistance** â€“ Get instant explanations, debugging help, and code insights.  
-- ðŸ“‚ **File Analysis** â€“ Upload or select files for detailed breakdowns.  
-- ðŸ’¡ **Smart Suggestions** â€“ Improve your code with AI-driven recommendations.  
-- ðŸŽ¨ **Clean UI** â€“ Minimal and distraction-free interface built with React + Tailwind.  
-- ðŸ› ï¸ **Extensible Backend** â€“ Node.js + Express API with modular routes.  
-- ðŸ”’ **In Progress** â€“ Actively being developed with new features coming soon!  
+## Environment Setup
+1. Copy `.env.example` to `.env`
+2. Fill real credentials and secrets
 
----
-
-## ðŸ› ï¸ Tech Stack
-
-**Frontend**  
-- âš›ï¸ React  
-- ðŸŽ¨ Tailwind CSS  
-- ðŸ”„ React Router  
-- âœ¨ GSAP (animations)  
-
-**Backend**  
-- ðŸŸ¢ Node.js + Express  
-- ðŸ—„ï¸ MySQL2 (with SSL for DigitalOcean)  
-- ðŸ“¦ Multer (file uploads)  
-- ðŸ“§ Nodemailer (email handling)  
-
-**AI**  
-- ðŸ§  [Ollama](https://ollama.ai) â€“ Local LLM integration  
-
----
-
-## ðŸš€ Getting Started
-
-Follow these steps to set up CodeScribeAI locally:
-
-### 1ï¸âƒ£ Clone the Repository
-```bash
-git clone https://github.com/your-username/codescribeAI.git
-cd codescribeAI
-```
-### 2ï¸âƒ£ Install Dependencies
-```bash
-Frontend:
-cd frontend
-npm install
-Backend:
-cd backend
-npm install
-```
-### 3️⃣ Configure Environment
-Copy `.env.example` to `.env` and fill values:
 ```bash
 cp .env.example .env
 ```
-Required values:
-```bash
+
+Required keys:
+```env
 APP_ENV=development
 SECRET_KEY=replace-with-a-long-random-string
+FRONTEND_URL=http://localhost:5173
+SESSION_TTL_SECONDS=3600
+SESSIONS_DB_PATH=sessions.db
 GITHUB_CLIENT_ID=your_github_client_id
 GITHUB_CLIENT_SECRET=your_github_client_secret
 GITHUB_TOKEN=your_github_token
 OLLAMA_URL=http://127.0.0.1:11434
+OLLAMA_MODEL=phi3:mini
+OLLAMA_FALLBACK_MODELS=
 ```
-Security notes:
-- Never commit `.env` to git.
-- Rotate secrets immediately if they were ever shared.
-### 4ï¸âƒ£ Run the Project
-Start backend:
+
+Optional async keys:
+```env
+CELERY_BROKER_URL=redis://localhost:6379/0
+CELERY_RESULT_BACKEND=redis://localhost:6379/0
+```
+
+## Install
+### Backend
 ```bash
-cd backend
-npm run dev
-Start frontend:
+# from repo root
+python -m venv venv
+# Windows PowerShell
+.\venv\Scripts\Activate.ps1
+pip install fastapi uvicorn httpx python-dotenv itsdangerous pydantic celery
+```
+
+### Frontend
+```bash
+cd frontend
+npm install
+```
+
+## Run Locally
+### 1) Start Ollama
+```bash
+ollama serve
+ollama pull phi3:mini
+```
+
+### 2) Start backend
+```bash
+# from repo root
+.\venv\Scripts\Activate.ps1
+uvicorn main:app --reload --host 127.0.0.1 --port 8000
+```
+
+### 3) Start frontend
+```bash
 cd frontend
 npm run dev
 ```
 
----
+Open: `http://localhost:5173`
 
-## ðŸ“Œ Roadmap
- AI-powered debugging suggestions
+## Optional: Async Worker (Celery)
+Only needed if you use async task endpoints.
 
- Multi-file context awareness
+```bash
+# requires Redis running
+.\venv\Scripts\Activate.ps1
+celery -A main:celery_app worker --loglevel=info --pool=solo
+```
 
- Chat-like interface for conversations with AI
+## Testing and Quality
+### Backend tests
+```bash
+python -m unittest discover -s tests -v
+```
 
- Cloud deployment (Vercel + DigitalOcean)
+### Frontend lint
+```bash
+cd frontend
+npm run lint
+```
 
- Authentication & user profiles
+## Key API Endpoints
+- `GET /health`
+- `GET /api/ai-status`
+- `POST /api/chat`
+- `POST /api/chat-async` (optional, Celery)
+- `GET /repos/{username}`
+- `GET /repos/{owner}/{repo}/files?recursive=true`
+- `GET /repos/{owner}/{repo}/file-content?path=...`
 
-## ðŸ¤ Contributing
-Contributions are welcome!
+## Security Notes
+- Never commit `.env`.
+- Rotate any leaked credentials immediately.
+- For non-development environments:
+  - set a strong `SECRET_KEY`
+  - use secure deployment secrets management
 
-Fork the repo
-
-Create a feature branch (git checkout -b feature-name)
-
-Commit changes (git commit -m "Add feature")
-
-Push to your branch (git push origin feature-name)
-
-Open a Pull Request ðŸŽ‰
-
-## ðŸ“œ License
-This project is licensed under the MIT License.
-See the LICENSE file for details.
-
-## ðŸŒŸ Support
-If you like this project, please consider giving it a â­ on GitHub â€“ it helps a lot!
-
-## ðŸ“¸ Screenshots (Coming Soon)
-
-
+## Production Readiness
+See `PRODUCTION_READINESS.md` for checklist and current status.
