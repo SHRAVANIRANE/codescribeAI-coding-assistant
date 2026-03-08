@@ -2,6 +2,7 @@
 import os
 import asyncio
 import logging
+import sqlite3
 from fastapi import FastAPI, Depends, HTTPException, Response, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,7 +41,8 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # ---- Session persistence ----
-SESSIONS_FILE = "sessions.json"
+SESSIONS_FILE = "sessions.json"  # legacy migration source
+SESSIONS_DB_PATH = os.getenv("SESSIONS_DB_PATH", "sessions.db")
 
 # ---- GitHub API URL ----
 GITHUB_API_URL = "https://api.github.com/users"
@@ -59,21 +61,81 @@ class ChatResponse(BaseModel):
     meta: dict = {}
 
 
-def load_sessions():
-    if os.path.exists(SESSIONS_FILE):
+def _db_connect():
+    conn = sqlite3.connect(SESSIONS_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_session_store():
+    with _db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                expires REAL NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires)")
+
+
+def session_store_set(session_id: str, data: dict):
+    expires = float(data.get("expires", 0))
+    with _db_connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions (session_id, data, expires) VALUES (?, ?, ?)",
+            (session_id, json.dumps(data), expires),
+        )
+
+
+def session_store_get(session_id: str) -> Optional[dict]:
+    with _db_connect() as conn:
+        row = conn.execute(
+            "SELECT data, expires FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return None
+        if float(row["expires"]) < time.time():
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            return None
+        try:
+            return json.loads(row["data"])
+        except Exception:
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            return None
+
+
+def session_store_delete(session_id: str):
+    with _db_connect() as conn:
+        conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+
+
+def session_store_cleanup_expired():
+    with _db_connect() as conn:
+        conn.execute("DELETE FROM sessions WHERE expires < ?", (time.time(),))
+
+
+def migrate_legacy_sessions():
+    if not os.path.exists(SESSIONS_FILE):
+        return
+    try:
         with open(SESSIONS_FILE, "r") as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                return {}
-    return {}
+            legacy = json.load(f)
+    except Exception:
+        return
+    if not isinstance(legacy, dict):
+        return
+    for sid, data in legacy.items():
+        if isinstance(data, dict):
+            session_store_set(sid, data)
 
-def save_sessions():
-    with open(SESSIONS_FILE, "w") as f:
-        json.dump(sessions, f)
 
-sessions = load_sessions()
-
+init_session_store()
+migrate_legacy_sessions()
+session_store_cleanup_expired()
 # ---- Cookie signing ----
 SECRET_KEY = os.getenv("SECRET_KEY")
 if not SECRET_KEY:
@@ -207,7 +269,7 @@ def get_current_user(request: Request):
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         session_id = serializer.loads(cookie)["session_id"]
-        session = sessions.get(session_id)
+        session = session_store_get(session_id)
         if not session or session["expires"] < time.time():
             raise HTTPException(status_code=401, detail="Session expired")
         return session
@@ -251,9 +313,6 @@ async def github_login():
 async def github_callback(request: Request, code: str, state: Optional[str] = None):
     ensure_github_oauth_config()
     validate_oauth_state(request, state)
-    ensure_github_oauth_config()
-    if not state:
-        raise HTTPException(status_code=400, detail="Missing state parameter")
 
     async with httpx.AsyncClient() as client:
         token_response = await client.post(
@@ -272,13 +331,13 @@ async def github_callback(request: Request, code: str, state: Optional[str] = No
         user_data = await get_github_user(token_data["access_token"])
 
         session_id = str(uuid4())
-        sessions[session_id] = {
+        session_data = {
             "access_token": token_data["access_token"],
             "user": user_data["login"],
             "user_id": user_data["id"],
             "expires": time.time() + SESSION_TTL_SECONDS
         }
-        save_sessions()
+        session_store_set(session_id, session_data)
 
         signed_cookie = serializer.dumps({"session_id": session_id})
         response = RedirectResponse(url=FRONTEND_URL)
@@ -908,10 +967,8 @@ async def logout(request: Request, user=Depends(get_current_user)):
     except Exception:
         pass
 
-    # Remove from sessions.json if exists
-    if session_id and session_id in sessions:
-        sessions.pop(session_id, None)
-        save_sessions()
+    if session_id:
+        session_store_delete(session_id)
 
     # Clear cookie
     response = JSONResponse({"message": "Logged out"})
@@ -1039,6 +1096,8 @@ async def get_task_status(task_id: str):
 # 1. Containerize the application and Celery worker using Docker[cite: 347, 348, 349].
 # 2. Deploy it to a platform like Google Kubernetes Engine (GKE)[cite: 373, 374, 375].
 # 3. Use managed services like Vertex AI Vector Search for your database and Vertex AI Endpoints for LLM serving[cite: 417, 422].
+
+
 
 
 

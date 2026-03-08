@@ -11,8 +11,9 @@
 ## 2. Auth & Sessions
 - [x] Session cookie uses environment-based `secure` and `samesite`.
 - [x] Session TTL configurable (`SESSION_TTL_SECONDS`).
-- [ ] Replace `sessions.json` with Redis/DB-backed session store.
+- [x] Replace `sessions.json` with SQLite-backed session store (`sessions.db`).
 - [ ] Add CSRF protections for state-changing endpoints.
+- [ ] Optional: move sessions from SQLite to Redis for multi-instance horizontal scaling.
 
 ## 3. Reliability
 - [x] AI model fallback and status endpoint (`/api/ai-status`) added.
@@ -28,7 +29,8 @@
 
 ## 5. Quality Gates
 - [x] Static checks currently passing (`py_compile`, frontend lint).
-- [ ] Add backend API tests (auth, files, chat).
+- [x] Add backend API tests for auth/session lifecycle (`tests/test_auth_sessions.py`).
+- [ ] Extend backend API tests to files/chat endpoints.
 - [ ] Add frontend integration tests (repo tree + file preview + chat).
 - [ ] CI pipeline enforcing lint/tests before merge.
 
