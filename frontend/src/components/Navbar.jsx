@@ -7,6 +7,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { getCookie } from "@/lib/utils";
 
 export default function Navbar() {
   const [user, setUser] = useState(null);
@@ -30,9 +31,13 @@ export default function Navbar() {
 
   const handleLogout = async () => {
     try {
+      const csrfToken = getCookie("csrf_token");
       await fetch("http://localhost:8000/logout", {
         method: "POST",
         credentials: "include",
+        headers: {
+          "x-csrf-token": csrfToken ?? "",
+        },
       });
     } catch (err) {
       console.error("Logout failed", err);

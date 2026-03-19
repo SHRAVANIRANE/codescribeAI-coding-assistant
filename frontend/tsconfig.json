@@ -5,7 +5,8 @@
       "@/*": ["src/*"]
     },
     "jsx": "react-jsx",
-    "allowJs": true
+    "allowJs": true,
+    "outDir": "./dist"
   },
   "include": ["src"]
 }

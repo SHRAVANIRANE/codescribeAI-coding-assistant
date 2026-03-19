@@ -2,6 +2,7 @@
 import RepoSelector from "./RepoSelector";
 import ChatInterface from "./ChatInterface";
 import FilePreview from "./FilePreview";
+import { getCookie } from "@/lib/utils";
 
 function sortNodes(nodes) {
   return [...nodes].sort((a, b) => {
@@ -154,9 +155,13 @@ export default function ChatBox() {
     setLoading(true);
 
     try {
+      const csrfToken = getCookie("csrf_token");
       const res = await fetch("http://127.0.0.1:8000/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-csrf-token": csrfToken ?? "",
+        },
         body: JSON.stringify({
           message: input,
           repo: selectedRepo.name,

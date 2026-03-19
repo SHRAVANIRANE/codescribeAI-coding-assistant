@@ -124,4 +124,3 @@ export default function FilePreview({ owner, repo, filePath, askAI }) {
     </div>
   );
 }
-

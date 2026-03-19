@@ -1,20 +1,27 @@
-﻿import json
-import os
-import asyncio
+﻿import asyncio
+import json
 import logging
+import os
 import sqlite3
-from fastapi import FastAPI, Depends, HTTPException, Response, Request
-from fastapi.responses import RedirectResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from itsdangerous import URLSafeSerializer
-import httpx
-from typing import Optional
-from dotenv import load_dotenv
-from uuid import uuid4
 import time
+from typing import Optional
+from uuid import uuid4
+
+import httpx
+from celery import Celery
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse
+from itsdangerous import URLSafeSerializer
 from pydantic import BaseModel
 from starlette import status
-from celery import Celery
+
+# Optional Redis dependency for session storage.
+try:
+    import redis
+except ImportError:  # pragma: no cover
+    redis = None
 
 
 # Load environment variables first
@@ -34,18 +41,33 @@ OLLAMA_FALLBACK_MODELS = [
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
 COOKIE_SECURE = APP_ENV != "development"
+# NOTE: This app is often used with a separate frontend origin (e.g. Vite on :5173).
+# In production, you should host the frontend from the same origin as the API or
+# use SameSite=None + Secure cookies (and serve over HTTPS).
 COOKIE_SAMESITE = "Lax" if APP_ENV == "development" else "Strict"
+CSRF_ENABLED = APP_ENV != "development"
+CSRF_COOKIE_NAME = "csrf_token"
+CSRF_HEADER_NAME = "x-csrf-token"
+
 app = FastAPI()
 logger = logging.getLogger("codescribe")
 if not logger.handlers:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
 
 # ---- Session persistence ----
-SESSIONS_FILE = "sessions.json"  # legacy migration source
+SESSION_STORE_TYPE = os.getenv("SESSION_STORE_TYPE", "sqlite").lower()
+SESSIONS_FILE = "sessions.json"  # legacy migration source (migrated at startup)
 SESSIONS_DB_PATH = os.getenv("SESSIONS_DB_PATH", "sessions.db")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+# Redis client (lazy init).
+_redis_client = None
 
 # ---- GitHub API URL ----
 GITHUB_API_URL = "https://api.github.com/users"
+
 
 class ChatRequest(BaseModel):
     message: str
@@ -54,6 +76,7 @@ class ChatRequest(BaseModel):
     file: Optional[str] = None
     file_content: Optional[str] = None
     model: Optional[str] = None
+
 
 class ChatResponse(BaseModel):
     reply: str
@@ -67,22 +90,54 @@ def _db_connect():
     return conn
 
 
+def _get_redis_client():
+    global _redis_client
+    if _redis_client:
+        return _redis_client
+
+    if redis is None:
+        raise RuntimeError(
+            "Redis support is not installed. Install the 'redis' package or switch SESSION_STORE_TYPE to 'sqlite'."
+        )
+
+    _redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        _redis_client.ping()
+    except Exception as e:
+        raise RuntimeError(f"Unable to connect to Redis at {REDIS_URL}: {e}")
+    return _redis_client
+
+
 def init_session_store():
+    if SESSION_STORE_TYPE == "redis":
+        _get_redis_client()
+        return
+
     with _db_connect() as conn:
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 data TEXT NOT NULL,
                 expires REAL NOT NULL
             )
-            """
+            """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires)"
         )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires)")
 
 
 def session_store_set(session_id: str, data: dict):
     expires = float(data.get("expires", 0))
+
+    if SESSION_STORE_TYPE == "redis":
+        # Redis handles expiration at key level.
+        ttl = max(1, int(expires - time.time()))
+        if ttl <= 0:
+            return
+        client = _get_redis_client()
+        client.set(f"session:{session_id}", json.dumps(data), ex=ttl)
+        return
+
     with _db_connect() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO sessions (session_id, data, expires) VALUES (?, ?, ?)",
@@ -91,6 +146,21 @@ def session_store_set(session_id: str, data: dict):
 
 
 def session_store_get(session_id: str) -> Optional[dict]:
+    if SESSION_STORE_TYPE == "redis":
+        client = _get_redis_client()
+        raw = client.get(f"session:{session_id}")
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except Exception:
+            client.delete(f"session:{session_id}")
+            return None
+        if float(data.get("expires", 0)) < time.time():
+            client.delete(f"session:{session_id}")
+            return None
+        return data
+
     with _db_connect() as conn:
         row = conn.execute(
             "SELECT data, expires FROM sessions WHERE session_id = ?",
@@ -109,11 +179,20 @@ def session_store_get(session_id: str) -> Optional[dict]:
 
 
 def session_store_delete(session_id: str):
+    if SESSION_STORE_TYPE == "redis":
+        client = _get_redis_client()
+        client.delete(f"session:{session_id}")
+        return
+
     with _db_connect() as conn:
         conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
 
 
 def session_store_cleanup_expired():
+    if SESSION_STORE_TYPE == "redis":
+        # Redis expires keys automatically.
+        return
+
     with _db_connect() as conn:
         conn.execute("DELETE FROM sessions WHERE expires < ?", (time.time(),))
 
@@ -131,6 +210,7 @@ def migrate_legacy_sessions():
     for sid, data in legacy.items():
         if isinstance(data, dict):
             session_store_set(sid, data)
+    # Do not remove the legacy file automatically; keep it for audit and recovery.
 
 
 init_session_store()
@@ -152,8 +232,9 @@ app.add_middleware(
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],  # frontend
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
+
 
 @app.middleware("http")
 async def add_request_context(request: Request, call_next):
@@ -162,8 +243,17 @@ async def add_request_context(request: Request, call_next):
     response = await call_next(request)
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     response.headers["X-Request-ID"] = req_id
-    logger.info("%s %s -> %s (%sms) req_id=%s", request.method, request.url.path, response.status_code, elapsed_ms, req_id)
+    logger.info(
+        "%s %s -> %s (%sms) req_id=%s",
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+        req_id,
+    )
     return response
+
+
 # ---- Env vars ----
 GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
 GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
@@ -173,7 +263,7 @@ def ensure_github_oauth_config():
     if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
         raise HTTPException(
             status_code=500,
-            detail="GitHub OAuth is not configured. Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET."
+            detail="GitHub OAuth is not configured. Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET.",
         )
 
 
@@ -191,12 +281,13 @@ def validate_oauth_state(request: Request, state: Optional[str]):
         raise HTTPException(status_code=400, detail="OAuth state mismatch")
 
 
+import math
+import re
+from collections import defaultdict
+from datetime import datetime, timedelta
+
 # ---------- NEW: tiny in-memory TTL cache for GitHub responses ----------
 from functools import lru_cache
-from collections import defaultdict
-import re
-import math
-from datetime import datetime, timedelta
 
 _CACHE: dict[str, tuple[float, dict | list | str | int]] = {}
 CACHE_TTL_SECONDS = 45  # short TTL to stay fresh
@@ -204,6 +295,33 @@ _REPO_CONTEXT_CACHE: dict[str, tuple[float, dict]] = {}
 REPO_CONTEXT_TTL_SECONDS = 90
 _OLLAMA_MODELS_CACHE: tuple[float, list[str]] | None = None
 OLLAMA_MODELS_TTL_SECONDS = 30
+
+# ---------- Circuit breaker / retry policy for upstream dependencies ----------
+_CIRCUIT_STATE: dict[str, dict[str, float | int]] = {
+    "github": {"failures": 0, "open_until": 0},
+    "ollama": {"failures": 0, "open_until": 0},
+}
+MAX_FAILURES_BEFORE_OPEN = 3
+CIRCUIT_BREAKER_COOLDOWN_SECONDS = 30
+
+
+def _is_circuit_open(name: str) -> bool:
+    state = _CIRCUIT_STATE.get(name, {})
+    return time.time() < float(state.get("open_until", 0))
+
+
+def _record_failure(name: str):
+    state = _CIRCUIT_STATE.setdefault(name, {"failures": 0, "open_until": 0})
+    state["failures"] = int(state.get("failures", 0)) + 1
+    if state["failures"] >= MAX_FAILURES_BEFORE_OPEN:
+        state["open_until"] = time.time() + CIRCUIT_BREAKER_COOLDOWN_SECONDS
+
+
+def _record_success(name: str):
+    state = _CIRCUIT_STATE.setdefault(name, {"failures": 0, "open_until": 0})
+    state["failures"] = 0
+    state["open_until"] = 0
+
 
 def cache_get(key: str):
     hit = _CACHE.get(key)
@@ -215,11 +333,21 @@ def cache_get(key: str):
         return None
     return val
 
+
 def cache_set(key: str, val):
     _CACHE[key] = (time.time() + CACHE_TTL_SECONDS, val)
 
+
 # ---------- REPLACE: gh_get to use cache (drop-in safe) ----------
 async def gh_get(url: str):
+    if _is_circuit_open("github"):
+        return JSONResponse(
+            {
+                "reply": "GitHub service temporarily unavailable due to repeated errors. Try again shortly."
+            },
+            status_code=503,
+        )
+
     headers = {"Accept": "application/vnd.github.v3+json"}
     if GITHUB_TOKEN:
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
@@ -227,40 +355,76 @@ async def gh_get(url: str):
     ck = f"gh:{url}"
     cached = cache_get(ck)
     if cached is not None:
+
         class _Resp:
             status_code = 200
             headers = {}
+
             def json(self_nonlocal=cached):
                 return cached
+
         return _Resp()
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
-        r = await c.get(url, headers=headers)
-        # If token is invalid/revoked, retry once without auth for public repos.
-        if r.status_code == 401 and GITHUB_TOKEN:
-            r = await c.get(url, headers={"Accept": "application/vnd.github.v3+json"})
+    # Retry transient failures with exponential backoff.
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
+                r = await c.get(url, headers=headers)
+                # If token is invalid/revoked, retry once without auth for public repos.
+                if r.status_code == 401 and GITHUB_TOKEN:
+                    r = await c.get(
+                        url, headers={"Accept": "application/vnd.github.v3+json"}
+                    )
 
-    if r.status_code == 403 and r.headers.get("X-RateLimit-Remaining") == "0":
-        return JSONResponse(
-            {"reply": "GitHub rate limit reached. Try again in a few minutes."},
-            status_code=429
-        )
-    r.raise_for_status()
-    try:
-        cache_set(ck, r.json())
-    except Exception:
-        pass
-    return r
+            if r.status_code in (500, 502, 503, 504):
+                _record_failure("github")
+                if attempt < 3:
+                    await asyncio.sleep(0.5 * attempt)
+                    continue
+                r.raise_for_status()
+
+            # treat 429 as a transient failure but don't raise directly; allow caller to handle.
+            if r.status_code == 429:
+                _record_failure("github")
+                return JSONResponse(
+                    {"reply": "GitHub rate limit reached. Try again in a few minutes."},
+                    status_code=429,
+                )
+
+            r.raise_for_status()
+            _record_success("github")
+
+            try:
+                cache_set(ck, r.json())
+            except Exception:
+                pass
+            return r
+
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.TransportError) as e:
+            last_exc = e
+            _record_failure("github")
+            if attempt < 3:
+                await asyncio.sleep(0.5 * attempt)
+                continue
+            raise
+
+    # Shouldn't reach here; re-raise the last caught exception.
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unexpected error in gh_get")
+
 
 # ---- Helper: Fetch GitHub user ----
 async def get_github_user(access_token: str) -> dict:
     async with httpx.AsyncClient() as client:
         response = await client.get(
             "https://api.github.com/user",
-            headers={"Authorization": f"Bearer {access_token}"}
+            headers={"Authorization": f"Bearer {access_token}"},
         )
         response.raise_for_status()
         return response.json()
+
 
 # ---- Auth middleware (cookie reader) ----
 def get_current_user(request: Request):
@@ -278,18 +442,39 @@ def get_current_user(request: Request):
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid session")
 
+
+def validate_csrf(request: Request, session: dict = Depends(get_current_user)):
+    """Validate CSRF token for state-changing endpoints.
+
+    In production, we require a CSRF token either via the X-CSRF-Token header or the csrf_token cookie.
+    This is deliberately relaxed in development to avoid needing added frontend plumbing.
+    """
+    if not CSRF_ENABLED:
+        return
+
+    token = request.headers.get(CSRF_HEADER_NAME) or request.cookies.get(
+        CSRF_COOKIE_NAME
+    )
+    expected = session.get("csrf_token")
+    if not token or not expected or token != expected:
+        raise HTTPException(status_code=403, detail="Invalid or missing CSRF token")
+
+
 # ---- Routes ----
 @app.get("/")
 async def root():
     return {"message": "Welcome to CodeScribeAI API"}
 
+
 @app.get("/test")
 async def test_endpoint():
     return {"message": "API is working"}
 
+
 @app.get("/test-auth")
 async def test_auth(user=Depends(get_current_user)):
     return {"message": f"Hello {user['user']}!"}
+
 
 @app.get("/login/github")
 async def github_login():
@@ -309,6 +494,7 @@ async def github_login():
     )
     return response
 
+
 @app.get("/auth/github/callback")
 async def github_callback(request: Request, code: str, state: Optional[str] = None):
     ensure_github_oauth_config()
@@ -323,7 +509,7 @@ async def github_callback(request: Request, code: str, state: Optional[str] = No
                 "code": code,
                 "state": state,
             },
-            headers={"Accept": "application/json"}
+            headers={"Accept": "application/json"},
         )
         token_response.raise_for_status()
         token_data = token_response.json()
@@ -331,11 +517,13 @@ async def github_callback(request: Request, code: str, state: Optional[str] = No
         user_data = await get_github_user(token_data["access_token"])
 
         session_id = str(uuid4())
+        csrf_token = os.urandom(16).hex()
         session_data = {
             "access_token": token_data["access_token"],
             "user": user_data["login"],
             "user_id": user_data["id"],
-            "expires": time.time() + SESSION_TTL_SECONDS
+            "expires": time.time() + SESSION_TTL_SECONDS,
+            "csrf_token": csrf_token,
         }
         session_store_set(session_id, session_data)
 
@@ -349,8 +537,20 @@ async def github_callback(request: Request, code: str, state: Optional[str] = No
             secure=COOKIE_SECURE,
             max_age=SESSION_TTL_SECONDS,
         )
-        response.delete_cookie("oauth_state", samesite=COOKIE_SAMESITE, secure=COOKIE_SECURE)
+        # This cookie is intentionally NOT httponly so the frontend can read it and send it in an X-CSRF-Token header.
+        response.set_cookie(
+            key=CSRF_COOKIE_NAME,
+            value=csrf_token,
+            httponly=False,
+            samesite=COOKIE_SAMESITE,
+            secure=COOKIE_SECURE,
+            max_age=SESSION_TTL_SECONDS,
+        )
+        response.delete_cookie(
+            "oauth_state", samesite=COOKIE_SAMESITE, secure=COOKIE_SECURE
+        )
         return response
+
 
 async def get_repo_default_branch(owner: str, repo: str) -> str:
     r = await gh_get(f"https://api.github.com/repos/{owner}/{repo}")
@@ -358,15 +558,19 @@ async def get_repo_default_branch(owner: str, repo: str) -> str:
         raise HTTPException(status_code=429, detail="Rate limited")
     return r.json()["default_branch"]
 
+
 async def count_all_files(owner: str, repo: str) -> int:
     # Use Git Trees API to count all blobs (files) recursively
     default_branch = await get_repo_default_branch(owner, repo)
-    r = await gh_get(f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}?recursive=1")
+    r = await gh_get(
+        f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}?recursive=1"
+    )
     if isinstance(r, JSONResponse):
         raise HTTPException(status_code=429, detail="Rate limited")
     data = r.json()
     tree = data.get("tree", [])
     return sum(1 for t in tree if t.get("type") == "blob")
+
 
 async def fetch_root_contents(owner: str, repo: str):
     r = await gh_get(f"https://api.github.com/repos/{owner}/{repo}/contents")
@@ -374,10 +578,18 @@ async def fetch_root_contents(owner: str, repo: str):
         raise HTTPException(status_code=429, detail="Rate limited")
     return r.json()
 
+
 async def get_readme_text(owner: str, repo: str) -> str | None:
     # Try common README names in the root
     items = await fetch_root_contents(owner, repo)
-    readme = next((f for f in items if f.get("type")=="file" and f["name"].lower().startswith("readme")), None)
+    readme = next(
+        (
+            f
+            for f in items
+            if f.get("type") == "file" and f["name"].lower().startswith("readme")
+        ),
+        None,
+    )
     if not readme:
         return None
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
@@ -440,7 +652,7 @@ async def get_readme_text(owner: str, repo: str) -> str | None:
 #                 return ChatResponse(reply=ai.get("response", "").strip() or "âš ï¸ AI returned empty response.")
 #         except Exception as e:
 #             return ChatResponse(reply=f"âš ï¸ Could not reach AI backend: {e}")
-        
+
 #     # 2b) â€œWhat is this repo about?â€ â†’ try README first, else LLM
 #     if "what is this repo" in msg or "explain this repo" in msg or "summary" in msg:
 #         try:
@@ -454,7 +666,7 @@ async def get_readme_text(owner: str, repo: str) -> str | None:
 
 #         if readme:
 #             return ChatResponse(reply=readme)
-        
+
 #         # Detect programming languages used in repo
 #     if "what programming languages" in msg or "languages used" in msg or "language breakdown" in msg:
 #         try:
@@ -462,15 +674,15 @@ async def get_readme_text(owner: str, repo: str) -> str | None:
 #             r = await gh_get(url)
 #             if isinstance(r, JSONResponse):  # rate limited
 #                 return ChatResponse(reply="âš ï¸ GitHub rate limit reached. Please try again later.")
-            
+
 #             data = r.json()
 #             if not data:
 #                 return ChatResponse(reply="No language data found for this repo.")
-            
+
 #             total = sum(data.values())
 #             percentages = {lang: round((size / total) * 100, 2) for lang, size in data.items()}
 #             breakdown = ", ".join([f"{lang} ({pct}%)" for lang, pct in percentages.items()])
-            
+
 #             return ChatResponse(
 #                 reply=f"Programming languages used in {req.repo}: {breakdown}",
 #                 meta={"languages": percentages}
@@ -491,12 +703,14 @@ async def get_readme_text(owner: str, repo: str) -> str | None:
 #     except Exception as e:
 #         return ChatResponse(reply=f"âš ï¸ Could not reach AI backend: {e}")
 
+
 # ---------- NEW: extra GitHub helpers ----------
 async def get_repo_meta(owner: str, repo: str) -> dict:
     r = await gh_get(f"https://api.github.com/repos/{owner}/{repo}")
     if isinstance(r, JSONResponse):
         raise HTTPException(status_code=429, detail="Rate limited")
     return r.json()
+
 
 async def get_contributors(owner: str, repo: str) -> list[dict]:
     r = await gh_get(f"https://api.github.com/repos/{owner}/{repo}/contributors")
@@ -505,6 +719,7 @@ async def get_contributors(owner: str, repo: str) -> list[dict]:
     data = r.json()
     return data if isinstance(data, list) else []
 
+
 async def get_languages(owner: str, repo: str) -> dict[str, int]:
     r = await gh_get(f"https://api.github.com/repos/{owner}/{repo}/languages")
     if isinstance(r, JSONResponse):
@@ -512,14 +727,24 @@ async def get_languages(owner: str, repo: str) -> dict[str, int]:
     data = r.json()
     return data if isinstance(data, dict) else {}
 
+
 # ---------- NEW: build context to ground the LLM ----------
-async def build_repo_context(owner: str, repo: str, max_files: int = 12, include_readme: bool = False) -> dict:
+async def build_repo_context(
+    owner: str, repo: str, max_files: int = 12, include_readme: bool = False
+) -> dict:
     ck = f"{owner}/{repo}:readme={int(include_readme)}:files={max_files}"
     cached = _REPO_CONTEXT_CACHE.get(ck)
     if cached and time.time() < cached[0]:
         return cached[1]
 
-    context: dict = {"owner": owner, "repo": repo, "files": [], "dirs": [], "languages": {}, "readme": ""}
+    context: dict = {
+        "owner": owner,
+        "repo": repo,
+        "files": [],
+        "dirs": [],
+        "languages": {},
+        "readme": "",
+    }
 
     tasks = [
         fetch_root_contents(owner, repo),
@@ -555,16 +780,25 @@ async def build_repo_context(owner: str, repo: str, max_files: int = 12, include
         context["description"] = ""
 
     context["contributors_count"] = 0 if isinstance(contr, Exception) else len(contr)
-    context["readme"] = "" if isinstance(readme, Exception) or not readme else str(readme)[:1000]
+    context["readme"] = (
+        "" if isinstance(readme, Exception) or not readme else str(readme)[:1000]
+    )
 
     _REPO_CONTEXT_CACHE[ck] = (time.time() + REPO_CONTEXT_TTL_SECONDS, context)
     return context
 
+
 # ---------- NEW: smarter intent detection ----------
 INTENT_PATTERNS = [
     ("summarize_file", r"\b(explain|summarize|describe|what does)\b.*\b(file|code)\b"),
-    ("repo_structure", r"\b(file structure|folder structure|project structure|repo structure|directory structure|tree)\b"),
-    ("list_files", r"\b(list|show|display|what are)\b.*\b(files|file list)\b|\bfiles in (this|the) repo\b"),
+    (
+        "repo_structure",
+        r"\b(file structure|folder structure|project structure|repo structure|directory structure|tree)\b",
+    ),
+    (
+        "list_files",
+        r"\b(list|show|display|what are)\b.*\b(files|file list)\b|\bfiles in (this|the) repo\b",
+    ),
     ("get_languages", r"\b(language|languages|language breakdown)\b"),
     ("count_files", r"\b(how many|number of)\s+files\b|\bcount files\b"),
     ("get_stars", r"\b(stars?|stargazers?)\b"),
@@ -573,12 +807,14 @@ INTENT_PATTERNS = [
     ("summarize_repo", r"\b(summary|summarize|explain|describe|about)\b"),
 ]
 
+
 def detect_intent(msg: str) -> str:
     text = msg.lower().strip()
     for intent, pat in INTENT_PATTERNS:
         if re.search(pat, text):
             return intent
     return "freeform"  # <â€” anything else goes to LLM (ChatGPT-like)
+
 
 async def get_ollama_models() -> list[str]:
     global _OLLAMA_MODELS_CACHE
@@ -590,14 +826,20 @@ async def get_ollama_models() -> list[str]:
             res = await c.get(f"{OLLAMA_URL}/api/tags")
             res.raise_for_status()
             payload = res.json()
-            models = [m.get("name", "") for m in payload.get("models", []) if m.get("name")]
+            models = [
+                m.get("name", "") for m in payload.get("models", []) if m.get("name")
+            ]
             _OLLAMA_MODELS_CACHE = (time.time() + OLLAMA_MODELS_TTL_SECONDS, models)
             return models
     except Exception:
         return []
 
+
 # ---------- NEW: robust LLM call with system-style instruction ----------
 async def call_llm(prompt: str, requested_model: Optional[str] = None) -> str:
+    if _is_circuit_open("ollama"):
+        return "AI backend temporarily unavailable due to repeated errors. Try again shortly."
+
     installed = await get_ollama_models()
 
     # Priority: request model -> configured default -> configured fallbacks -> installed models
@@ -610,33 +852,63 @@ async def call_llm(prompt: str, requested_model: Optional[str] = None) -> str:
 
     errors: list[str] = []
     for model_name in candidates:
-        try:
-            async with httpx.AsyncClient(timeout=90.0) as c:
-                res = await c.post(
-                    f"{OLLAMA_URL}/api/generate",
-                    json={
-                        "model": model_name,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {"num_predict": 220, "temperature": 0.2},
-                    },
-                )
-            if res.status_code == 404:
-                errors.append(f"{model_name}: not found")
-                continue
-            res.raise_for_status()
-            answer = (res.json().get("response") or "").strip()
-            if answer:
-                return answer
-            errors.append(f"{model_name}: empty response")
-        except httpx.ReadTimeout:
-            errors.append(f"{model_name}: timeout")
-        except httpx.ConnectError:
-            return f"Could not reach AI backend at {OLLAMA_URL}. Ensure Ollama is running."
-        except Exception as e:
-            errors.append(f"{model_name}: {repr(e)}")
+        last_exc = None
+        for attempt in range(1, 4):
+            try:
+                async with httpx.AsyncClient(timeout=90.0) as c:
+                    res = await c.post(
+                        f"{OLLAMA_URL}/api/generate",
+                        json={
+                            "model": model_name,
+                            "prompt": prompt,
+                            "stream": False,
+                            "options": {"num_predict": 220, "temperature": 0.2},
+                        },
+                    )
+                if res.status_code == 404:
+                    errors.append(f"{model_name}: not found")
+                    break
+                if res.status_code in (500, 502, 503, 504):
+                    _record_failure("ollama")
+                    if attempt < 3:
+                        await asyncio.sleep(0.5 * attempt)
+                        continue
+                    res.raise_for_status()
+
+                res.raise_for_status()
+                answer = (res.json().get("response") or "").strip()
+                if answer:
+                    _record_success("ollama")
+                    return answer
+                errors.append(f"{model_name}: empty response")
+                break
+
+            except httpx.ReadTimeout as e:
+                last_exc = e
+                errors.append(f"{model_name}: timeout")
+                _record_failure("ollama")
+                if attempt < 3:
+                    await asyncio.sleep(0.5 * attempt)
+                    continue
+                break
+            except httpx.ConnectError as e:
+                last_exc = e
+                _record_failure("ollama")
+                return f"Could not reach AI backend at {OLLAMA_URL}. Ensure Ollama is running."
+            except Exception as e:
+                last_exc = e
+                errors.append(f"{model_name}: {repr(e)}")
+                _record_failure("ollama")
+                break
+
+        # If we successfully got a response, return already happened.
+        # Otherwise, try next model.
+
+    if _is_circuit_open("ollama"):
+        return "AI backend temporarily unavailable due to repeated errors. Try again shortly."
 
     return "AI generation failed after model fallbacks: " + " | ".join(errors[:3])
+
 
 def format_context_block(ctx: dict) -> str:
     lines = []
@@ -650,9 +922,13 @@ def format_context_block(ctx: dict) -> str:
         langs = ", ".join([f"{k} {v}%" for k, v in ctx["languages"].items()])
         lines.append(f"Languages: {langs}")
     if ctx.get("files"):
-        lines.append("Top-level files:\n" + "\n".join(f"- {f}" for f in ctx["files"][:10]))
+        lines.append(
+            "Top-level files:\n" + "\n".join(f"- {f}" for f in ctx["files"][:10])
+        )
     if ctx.get("dirs"):
-        lines.append("Top-level directories:\n" + "\n".join(f"- {d}" for d in ctx["dirs"][:10]))
+        lines.append(
+            "Top-level directories:\n" + "\n".join(f"- {d}" for d in ctx["dirs"][:10])
+        )
     if ctx.get("readme"):
         lines.append("README excerpt:\n" + ctx["readme"][:600])
     return "\n\n".join(lines)
@@ -671,7 +947,10 @@ async def chat(req: ChatRequest):
     try:
         if intent == "summarize_file":
             if not req.file_content:
-                return ChatResponse(reply="[WARN] To explain a file, please select one first.", meta={"grounded": False})
+                return ChatResponse(
+                    reply="[WARN] To explain a file, please select one first.",
+                    meta={"grounded": False},
+                )
 
             # Large files (especially notebooks) can time out local models.
             max_chars = 12000
@@ -683,7 +962,11 @@ async def chat(req: ChatRequest):
                 "Highlight its purpose, key functions, and overall structure.\n\n"
                 f"File: `{req.file}`\n\n"
                 f"Code:\n```\n{file_body}\n```\n\n"
-                + ("Note: The file content was truncated for speed.\n\n" if truncated else "")
+                + (
+                    "Note: The file content was truncated for speed.\n\n"
+                    if truncated
+                    else ""
+                )
                 + "Explanation:"
             )
             ans = await call_llm(prompt, req.model)
@@ -696,7 +979,9 @@ async def chat(req: ChatRequest):
             total = sum(langs.values()) or 1
             pct = {k: round(v * 100 / total, 2) for k, v in langs.items()}
             breakdown = ", ".join(f"{k} ({v}%)" for k, v in pct.items())
-            return ChatResponse(reply=f"Languages in {req.repo}: {breakdown}", meta={"languages": pct})
+            return ChatResponse(
+                reply=f"Languages in {req.repo}: {breakdown}", meta={"languages": pct}
+            )
 
         if intent == "repo_structure":
             items = await fetch_root_contents(req.github_user, req.repo)
@@ -704,7 +989,9 @@ async def chat(req: ChatRequest):
             dirs = [x["path"] for x in items if x.get("type") == "dir"]
             sample = (dirs[:12] + files[:12])[:20]
             if not sample:
-                return ChatResponse(reply=f"I could not find visible root items for {req.github_user}/{req.repo}.")
+                return ChatResponse(
+                    reply=f"I could not find visible root items for {req.github_user}/{req.repo}."
+                )
             listing = "\n".join(f"- {p}" for p in sample)
             return ChatResponse(
                 reply=(
@@ -720,39 +1007,57 @@ async def chat(req: ChatRequest):
             items = await fetch_root_contents(req.github_user, req.repo)
             files = [x["path"] for x in items if x.get("type") == "file"]
             if not files:
-                return ChatResponse(reply=f"No root-level files found in {req.github_user}/{req.repo}.", meta={"grounded": True})
+                return ChatResponse(
+                    reply=f"No root-level files found in {req.github_user}/{req.repo}.",
+                    meta={"grounded": True},
+                )
             listing = "\n".join(f"- {p}" for p in files[:40])
             return ChatResponse(
                 reply=f"Root files in {req.github_user}/{req.repo}:\n{listing}",
-                meta={"files_returned": min(len(files), 40), "total_root_files": len(files), "grounded": True},
+                meta={
+                    "files_returned": min(len(files), 40),
+                    "total_root_files": len(files),
+                    "grounded": True,
+                },
             )
 
         if intent == "count_files":
             # count **all** files via git trees API (more impressive than root only)
             try:
                 total = await count_all_files(req.github_user, req.repo)
-                return ChatResponse(reply=f"{req.repo} contains {total} files (all paths).")
+                return ChatResponse(
+                    reply=f"{req.repo} contains {total} files (all paths)."
+                )
             except Exception:
                 # graceful fallback to root only
                 files = await fetch_root_contents(req.github_user, req.repo)
-                n = len([x for x in files if x.get('type') == 'file'])
-                return ChatResponse(reply=f"{req.repo} has {n} files in the root directory (full count unavailable).")
+                n = len([x for x in files if x.get("type") == "file"])
+                return ChatResponse(
+                    reply=f"{req.repo} has {n} files in the root directory (full count unavailable)."
+                )
 
         if intent == "get_stars":
             meta = await get_repo_meta(req.github_user, req.repo)
             stars = meta.get("stargazers_count", 0)
-            return ChatResponse(reply=f"{req.repo} has * {stars} stars.", meta={"stars": stars})
+            return ChatResponse(
+                reply=f"{req.repo} has * {stars} stars.", meta={"stars": stars}
+            )
 
         if intent == "get_repo_name":
             return ChatResponse(reply=f"The name of this repository is **{req.repo}**.")
 
         if intent == "get_contributors":
             contr = await get_contributors(req.github_user, req.repo)
-            return ChatResponse(reply=f"{req.repo} has {len(contr)} contributors.", meta={"contributors": len(contr)})
+            return ChatResponse(
+                reply=f"{req.repo} has {len(contr)} contributors.",
+                meta={"contributors": len(contr)},
+            )
 
     except HTTPException as e:
         if e.status_code == 429:
-            return ChatResponse(reply="[WARN] GitHub rate limit reached. Please try again later.")
+            return ChatResponse(
+                reply="[WARN] GitHub rate limit reached. Please try again later."
+            )
         return ChatResponse(reply=f"[WARN] GitHub error: {e.detail}")
     except Exception as e:
         # Do not block; still try LLM with context
@@ -775,7 +1080,10 @@ async def chat(req: ChatRequest):
     # 3) Anything else (general world questions, arbitrary chat) -> ChatGPT-like
     #    Still include repo context in case it helps, but do not force it.
     ctx = await build_repo_context(req.github_user, req.repo, include_readme=False)
-    repo_signal = re.search(r"\b(repo|repository|project|file|folder|directory|codebase|this repo)\b", msg.lower())
+    repo_signal = re.search(
+        r"\b(repo|repository|project|file|folder|directory|codebase|this repo)\b",
+        msg.lower(),
+    )
     if repo_signal and not (ctx.get("files") or ctx.get("dirs") or ctx.get("readme")):
         return ChatResponse(
             reply=f"I couldn't fetch repository context for {req.github_user}/{req.repo} right now, so I can't give a grounded answer yet.",
@@ -792,6 +1100,7 @@ async def chat(req: ChatRequest):
     )
     ans = await call_llm(prompt, req.model)
     return ChatResponse(reply=ans, sources=[], meta={"grounded": False})
+
 
 @app.get("/health")
 async def health():
@@ -810,7 +1119,8 @@ async def health():
             r.raise_for_status()
     except Exception as e:
         probs.append(f"ollama: {e}")
-    return {"ok": len(probs)==0, "problems": probs}
+    return {"ok": len(probs) == 0, "problems": probs}
+
 
 @app.get("/api/ai-status")
 async def ai_status():
@@ -823,30 +1133,33 @@ async def ai_status():
         "ok": len(models) > 0,
     }
 
-    
+
 @app.get("/me")
 async def get_me(user=Depends(get_current_user)):
     async with httpx.AsyncClient() as client:
         r = await client.get(
             "https://api.github.com/user",
-            headers={"Authorization": f"Bearer {user['access_token']}"}
+            headers={"Authorization": f"Bearer {user['access_token']}"},
         )
         r.raise_for_status()
         return r.json()
+
 
 @app.get("/repos/{username}")
 async def get_github_repos(username: str):
     async with httpx.AsyncClient() as client:
         response = await client.get(f"{GITHUB_API_URL}/{username}/repos")
-        
+
         if response.status_code == 404:
             raise HTTPException(status_code=404, detail="User not found")
         elif response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail="Error fetching repositories")
-        
+            raise HTTPException(
+                status_code=response.status_code, detail="Error fetching repositories"
+            )
+
         return response.json()  # âœ… send everything back
 
-    
+
 @app.get("/repos/{owner}/{repo}/languages")
 async def get_repo_languages(owner: str, repo: str):
     url = f"https://api.github.com/repos/{owner}/{repo}/languages"
@@ -858,15 +1171,20 @@ async def get_repo_languages(owner: str, repo: str):
         total = sum(data.values())
         if total == 0:
             return {"languages": {}, "percentages": {}}
-        percentages = {lang: round((size / total) * 100, 2) for lang, size in data.items()}
+        percentages = {
+            lang: round((size / total) * 100, 2) for lang, size in data.items()
+        }
         return {"languages": data, "percentages": percentages}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch languages: {e}")
-    
+
+
 @app.get("/repos/{owner}/{repo}/files")
-async def get_repo_files(owner: str, repo: str, path: str = "", recursive: bool = False):
+async def get_repo_files(
+    owner: str, repo: str, path: str = "", recursive: bool = False
+):
     """
     Fetch the file/directory structure of a repository.
     By default, lists the root. You can pass ?path=subdir to drill deeper.
@@ -874,7 +1192,9 @@ async def get_repo_files(owner: str, repo: str, path: str = "", recursive: bool 
     if recursive:
         try:
             default_branch = await get_repo_default_branch(owner, repo)
-            r = await gh_get(f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}?recursive=1")
+            r = await gh_get(
+                f"https://api.github.com/repos/{owner}/{repo}/git/trees/{default_branch}?recursive=1"
+            )
             if isinstance(r, JSONResponse):
                 raise HTTPException(status_code=429, detail="GitHub rate limit reached")
             payload = r.json()
@@ -888,7 +1208,11 @@ async def get_repo_files(owner: str, repo: str, path: str = "", recursive: bool 
                     continue
                 if base and not (item_path == base or item_path.startswith(base + "/")):
                     continue
-                out_path = item_path[len(base) + 1:] if base and item_path.startswith(base + "/") else item_path
+                out_path = (
+                    item_path[len(base) + 1 :]
+                    if base and item_path.startswith(base + "/")
+                    else item_path
+                )
                 if not out_path:
                     continue
                 if item.get("type") == "tree":
@@ -922,7 +1246,9 @@ async def get_repo_files(owner: str, repo: str, path: str = "", recursive: bool 
             r = await client.get(url, headers=headers)
             # Retry unauthenticated when token is bad.
             if r.status_code == 401 and GITHUB_TOKEN:
-                r = await client.get(url, headers={"Accept": "application/vnd.github.v3+json"})
+                r = await client.get(
+                    url, headers={"Accept": "application/vnd.github.v3+json"}
+                )
 
         if r.status_code == 403 and r.headers.get("X-RateLimit-Remaining") == "0":
             raise HTTPException(status_code=429, detail="GitHub rate limit reached")
@@ -937,7 +1263,10 @@ async def get_repo_files(owner: str, repo: str, path: str = "", recursive: bool 
                 detail = r.json().get("message", "")
             except Exception:
                 detail = r.text
-            raise HTTPException(status_code=r.status_code, detail=detail or "Failed to fetch repository files")
+            raise HTTPException(
+                status_code=r.status_code,
+                detail=detail or "Failed to fetch repository files",
+            )
 
         data = r.json()
         tree = [
@@ -954,7 +1283,6 @@ async def get_repo_files(owner: str, repo: str, path: str = "", recursive: bool 
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch repo files: {e}")
-
 
 
 @app.post("/logout")
@@ -975,22 +1303,25 @@ async def logout(request: Request, user=Depends(get_current_user)):
     response.delete_cookie("session_id", samesite=COOKIE_SAMESITE, secure=COOKIE_SECURE)
     return response
 
+
 @app.get("/repos/{owner}/{repo}/file-content")
 async def get_file_content(owner: str, repo: str, path: str):
     """Fetches the raw content of a specific file from a GitHub repository."""
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
     headers = {"Accept": "application/vnd.github.v3.raw"}
-    
+
     # Add your GitHub token for authentication and higher rate limits
     if GITHUB_TOKEN:
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
-    
+
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
             res = await client.get(url, headers=headers)
             # Retry without auth if token is invalid/revoked; works for public repos.
             if res.status_code == 401 and GITHUB_TOKEN:
-                res = await client.get(url, headers={"Accept": "application/vnd.github.v3.raw"})
+                res = await client.get(
+                    url, headers={"Accept": "application/vnd.github.v3.raw"}
+                )
 
         if res.status_code == 404:
             raise HTTPException(status_code=404, detail="File not found in repository.")
@@ -1002,23 +1333,24 @@ async def get_file_content(owner: str, repo: str, path: str):
                 detail = res.json().get("message", "")
             except Exception:
                 detail = res.text
-            raise HTTPException(status_code=res.status_code, detail=detail or "Failed to fetch file content.")
+            raise HTTPException(
+                status_code=res.status_code,
+                detail=detail or "Failed to fetch file content.",
+            )
 
         return Response(content=res.text, media_type="text/plain")
     except httpx.HTTPStatusError as e:
         print(f"Error fetching file content: {e}")
         raise HTTPException(
             status_code=e.response.status_code,
-            detail="File not found or access denied."
+            detail="File not found or access denied.",
         )
     except httpx.RequestError as e:
         # Handle other httpx request errors (e.g., network issues)
         print(f"Error fetching file content: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to connect to GitHub API."
-        )
-    
+        raise HTTPException(status_code=500, detail="Failed to connect to GitHub API.")
+
+
 # --- Asynchronous Chat Endpoint (for long-running tasks) ---
 # It receives a user's message and offloads it to a Celery worker.
 class ChatQuery(BaseModel):
@@ -1029,24 +1361,29 @@ class ChatQuery(BaseModel):
     file_content: Optional[str] = None
     model: Optional[str] = None
 
+
 @app.post("/api/chat-async", status_code=status.HTTP_202_ACCEPTED)
 async def chat_async(query: ChatQuery):
     # This is the endpoint that the frontend calls
     print(f"Received query: '{query.message}' for repo: {query.repo}")
 
     try:
-        task = process_chat_query.delay(query.message, query.repo, query.github_user, query.file, query.file_content)
+        task = process_chat_query.delay(
+            query.message, query.repo, query.github_user, query.file, query.file_content
+        )
         return {"task_id": task.id}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Async worker unavailable: {e}")
+
 
 # --- Celery Configuration ---
 # Celery instance that will be used to run tasks
 celery_app = Celery(
     "tasks",
     broker=os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0"),
-    backend=os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/0")
+    backend=os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/0"),
 )
+
 
 # --- Celery Task Definition ---
 # This is the function that the Celery worker will run in the background.
@@ -1063,14 +1400,15 @@ def process_chat_query(message, repo, github_user, file, file_content):
     # In a real implementation, you would:
     # 1. Use the RAG pipeline to get a response and source docs.
     # 2. Return the result.
-    
+
     # Mocking a response for now
     reply = f"Thank you for asking about `{message}`. I've processed your query for the repository `{repo}`. The answer will be available soon."
-    
+
     # Simulate source docs
     sources = [{"file_path": file, "line_numbers": "1-10"}] if file else []
-    
+
     return {"reply": reply, "sources": sources}
+
 
 # --- Polling Endpoint ---
 # This endpoint allows the frontend to check on the status of a Celery task.
@@ -1086,6 +1424,7 @@ async def get_task_status(task_id: str):
     else:
         return {"status": task_result.state}
 
+
 # --- Git Integration (OAuth and Repositories) ---
 # The blueprint mentions using python-gitlab for GitLab integration[cite: 63, 64].
 # A similar library, PyGithub, is recommended for GitHub integration[cite: 87].
@@ -1096,19 +1435,3 @@ async def get_task_status(task_id: str):
 # 1. Containerize the application and Celery worker using Docker[cite: 347, 348, 349].
 # 2. Deploy it to a platform like Google Kubernetes Engine (GKE)[cite: 373, 374, 375].
 # 3. Use managed services like Vertex AI Vector Search for your database and Vertex AI Endpoints for LLM serving[cite: 417, 422].
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

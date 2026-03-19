@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+httpx
+python-dotenv
+itsdangerous
+pydantic
+celery
+redis
+pre-commit
+black
+isort

@@ -75,16 +75,22 @@ class AuthSessionTests(unittest.TestCase):
         res = self.client.get("/login/github", follow_redirects=False)
         self.assertEqual(res.status_code, 307)
         self.assertIn("oauth_state=", res.headers.get("set-cookie", ""))
-        self.assertIn("github.com/login/oauth/authorize", res.headers.get("location", ""))
+        self.assertIn(
+            "github.com/login/oauth/authorize", res.headers.get("location", "")
+        )
 
     def test_callback_rejects_missing_state_cookie(self):
-        res = self.client.get("/auth/github/callback?code=abc&state=s1", follow_redirects=False)
+        res = self.client.get(
+            "/auth/github/callback?code=abc&state=s1", follow_redirects=False
+        )
         self.assertEqual(res.status_code, 400)
         self.assertIn("OAuth state cookie", res.json().get("detail", ""))
 
     def test_callback_rejects_state_mismatch(self):
         self.client.get("/login/github", follow_redirects=False)
-        res = self.client.get("/auth/github/callback?code=abc&state=wrong", follow_redirects=False)
+        res = self.client.get(
+            "/auth/github/callback?code=abc&state=wrong", follow_redirects=False
+        )
         self.assertEqual(res.status_code, 400)
         self.assertIn("state mismatch", res.json().get("detail", ""))
 

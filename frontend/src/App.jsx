@@ -16,9 +16,11 @@ export default function App() {
           <Route
             path="/playground"
             element={
-              <ProtectedRoute>
-                <Playground />
-              </ProtectedRoute>
+              (
+                <ProtectedRoute>
+                  <Playground />
+                </ProtectedRoute>
+              )
             }
           />
           <Route path="/" element={<Home />} />
