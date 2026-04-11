@@ -1,4 +1,4 @@
-﻿# 🤖 CodeScribeAI
+<img width="1874" height="878" alt="image" src="https://github.com/user-attachments/assets/05efa7b3-b1b0-4c26-9e89-fed87a4b4bcb" />﻿# 🤖 CodeScribeAI
 
 CodeScribeAI is a local-first coding assistant with:
 
@@ -6,6 +6,14 @@ CodeScribeAI is a local-first coding assistant with:
 - React + Vite frontend
 - GitHub repository analysis
 - Ollama-powered AI responses
+
+## UI
+<img width="1874" height="878" alt="image" src="https://github.com/user-attachments/assets/ce26b35b-2b46-45b7-9b2d-8c555f59c0cf" />
+<img width="1886" height="893" alt="image" src="https://github.com/user-attachments/assets/73121360-9bf9-45f6-bd26-233ec7166536" />
+<img width="1903" height="813" alt="image" src="https://github.com/user-attachments/assets/471f902f-07d5-4d90-8b62-64c30e2f8ad4" />
+
+
+
 
 ## Current Architecture
 
