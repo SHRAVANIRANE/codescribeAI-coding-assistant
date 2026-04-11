@@ -1,4 +1,4 @@
-<img width="1874" height="878" alt="image" src="https://github.com/user-attachments/assets/05efa7b3-b1b0-4c26-9e89-fed87a4b4bcb" />﻿# 🤖 CodeScribeAI
+# 🤖 CodeScribeAI
 
 CodeScribeAI is a local-first coding assistant with:
 
